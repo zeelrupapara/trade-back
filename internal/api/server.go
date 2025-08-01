@@ -20,6 +20,7 @@ import (
 	"github.com/trade-back/internal/messaging"
 	"github.com/trade-back/internal/websocket"
 	"github.com/trade-back/pkg/config"
+	"github.com/trade-back/pkg/models"
 )
 
 // Server represents the HTTP API server
@@ -120,6 +121,9 @@ func (s *Server) setupRoutes() {
 	// Market data endpoints
 	apiV1.HandleFunc("/symbols", s.handleGetSymbols).Methods("GET")
 	apiV1.HandleFunc("/symbols/{symbol}", s.handleGetSymbol).Methods("GET")
+	
+	// Debug endpoint
+	apiV1.HandleFunc("/debug/status", s.handleDebugStatus).Methods("GET")
 	apiV1.HandleFunc("/symbols/{symbol}/price", s.handleGetPrice).Methods("GET")
 	apiV1.HandleFunc("/symbols/{symbol}/bars", s.handleGetBars).Methods("GET")
 	apiV1.HandleFunc("/symbols/{symbol}/enigma", s.handleGetEnigma).Methods("GET")
@@ -246,50 +250,121 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // handleGetSymbols retrieves list of trading symbols
 func (s *Server) handleGetSymbols(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	
+	// Debug logging
+	s.logger.Debug("handleGetSymbols called - START")
+	
+	// Check if MySQL connection exists
+	if s.mysqlDB == nil {
+		s.logger.Error("MySQL database connection is nil")
+		http.Error(w, "Database connection not available", http.StatusInternalServerError)
+		return
+	}
+	
+	s.logger.Debug("About to call mysqlDB.GetSymbols")
+	
+	// Get all symbols from database
+	symbols, err := s.mysqlDB.GetSymbols(ctx)
+	if err != nil {
+		s.logger.WithError(err).Error("Failed to get symbols")
+		http.Error(w, "Failed to retrieve symbols", http.StatusInternalServerError)
+		return
+	}
+	
+	s.logger.WithField("count", len(symbols)).Info("Retrieved symbols from database")
+	
+	// Apply filters
 	exchange := r.URL.Query().Get("exchange")
 	instrumentType := r.URL.Query().Get("type")
-	active := r.URL.Query().Get("active")
+	activeStr := r.URL.Query().Get("active")
 	
-	query := "SELECT * FROM symbols WHERE 1=1"
-	args := []interface{}{}
-	
-	if exchange != "" {
-		query += " AND exchange = ?"
-		args = append(args, exchange)
+	filteredSymbols := make([]*models.SymbolInfo, 0)
+	for _, symbol := range symbols {
+		// Filter by exchange
+		if exchange != "" && symbol.Exchange != exchange {
+			continue
+		}
+		
+		// Filter by instrument type
+		if instrumentType != "" && symbol.InstrumentType != instrumentType {
+			continue
+		}
+		
+		// Filter by active status
+		if activeStr != "" {
+			isActive := activeStr == "true"
+			if symbol.IsActive != isActive {
+				continue
+			}
+		}
+		
+		filteredSymbols = append(filteredSymbols, symbol)
 	}
 	
-	if instrumentType != "" {
-		query += " AND instrument_type = ?"
-		args = append(args, instrumentType)
-	}
-	
-	if active != "" {
-		query += " AND is_active = ?"
-		args = append(args, active == "true")
-	}
-	
-	// Execute query and return results
-	// Implementation depends on your database structure
+	// Return results
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"symbols": []interface{}{},
-		"count":   0,
+		"symbols": filteredSymbols,
+		"count":   len(filteredSymbols),
 	})
+}
+
+// handleDebugStatus returns debug information about server state
+func (s *Server) handleDebugStatus(w http.ResponseWriter, r *http.Request) {
+	status := map[string]interface{}{
+		"mysql_connected": s.mysqlDB != nil,
+		"influx_connected": s.influxDB != nil,
+		"redis_connected": s.redisCache != nil,
+		"nats_connected": s.natsClient != nil,
+		"ws_manager_connected": s.wsManager != nil,
+	}
+	
+	// Test MySQL connection if available
+	if s.mysqlDB != nil {
+		ctx := context.Background()
+		if err := s.mysqlDB.Health(ctx); err != nil {
+			status["mysql_health"] = "unhealthy: " + err.Error()
+		} else {
+			status["mysql_health"] = "healthy"
+			// Try to get symbol count
+			symbols, err := s.mysqlDB.GetSymbols(ctx)
+			if err != nil {
+				status["mysql_symbols"] = "error: " + err.Error()
+			} else {
+				status["mysql_symbols"] = len(symbols)
+			}
+		}
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
 
 // handleGetSymbol retrieves details for a specific symbol
 func (s *Server) handleGetSymbol(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	symbol := vars["symbol"]
+	ctx := r.Context()
+	
+	// Default to BINANCE exchange if not specified
+	exchange := "BINANCE"
 	
 	// Fetch symbol info from database
-	// Implementation depends on your database structure
+	symbolInfo, err := s.mysqlDB.GetSymbol(ctx, exchange, symbol)
+	if err != nil {
+		s.logger.WithError(err).Error("Failed to get symbol")
+		http.Error(w, "Failed to retrieve symbol", http.StatusInternalServerError)
+		return
+	}
+	
+	if symbolInfo == nil {
+		http.Error(w, "Symbol not found", http.StatusNotFound)
+		return
+	}
 	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"symbol": symbol,
-		"error":  "Not implemented",
-	})
+	json.NewEncoder(w).Encode(symbolInfo)
 }
 
 // handleGetPrice retrieves current price for a symbol

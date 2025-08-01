@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -400,4 +401,24 @@ func (rc *RedisClient) Subscribe(ctx context.Context, handler func(channel strin
 			}
 		}
 	}
+}
+
+// GetAllSessionTokens returns all active session tokens that have market watches
+func (rc *RedisClient) GetAllSessionTokens(ctx context.Context) ([]string, error) {
+	// Get all keys that match the market watch pattern
+	keys, err := rc.client.Keys(ctx, "marketwatch:*").Result()
+	if err != nil {
+		return nil, err
+	}
+	
+	// Extract session tokens from keys
+	tokens := make([]string, 0, len(keys))
+	for _, key := range keys {
+		// Key format is "marketwatch:TOKEN"
+		if parts := strings.SplitN(key, ":", 2); len(parts) == 2 {
+			tokens = append(tokens, parts[1])
+		}
+	}
+	
+	return tokens, nil
 }

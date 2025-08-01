@@ -25,6 +25,7 @@ type Hub struct {
 	redis        *cache.RedisClient
 	influxBatcher *InfluxBatcher
 	processor    *PriceProcessor
+	dynamicSymbols *DynamicSymbolManager
 	
 	// Configuration
 	cfg          *config.Config
@@ -85,21 +86,39 @@ func (h *Hub) Initialize(
 	h.mysql = mysql
 	h.redis = redis
 	
-	// Load active symbols from database
-	symbols, err := h.loadActiveSymbols(context.Background())
+	// Create dynamic symbol manager
+	h.dynamicSymbols = NewDynamicSymbolManager(h, redis, h.logger.Logger)
+	
+	// Get initial market watch symbols
+	initialSymbols, err := h.dynamicSymbols.getAllMarketWatchSymbols(context.Background())
 	if err != nil {
-		return fmt.Errorf("failed to load symbols: %w", err)
+		return fmt.Errorf("failed to get market watch symbols: %w", err)
+	}
+	
+	// Convert map to slice
+	symbols := make([]string, 0, len(initialSymbols))
+	for symbol := range initialSymbols {
+		symbols = append(symbols, symbol)
+	}
+	
+	// If no market watch symbols, start with empty list
+	if len(symbols) == 0 {
+		h.logger.Info("No market watch symbols found, starting with empty subscription")
+		symbols = []string{} // Empty list
 	}
 	
 	h.symbols = symbols
-	h.logger.WithField("symbols", len(symbols)).Info("Loaded active symbols")
+	h.logger.WithField("symbols", len(symbols)).Info("Loaded market watch symbols")
 	
 	// Create InfluxDB batcher
 	h.influxBatcher = NewInfluxBatcher(h.influx, h.logger.Logger)
 	
+	// Create price processor with 4 workers
+	h.processor = NewPriceProcessor(h, 4)
+	
 	// Create connection pool
 	h.pool = NewConnectionPool(symbols, &h.cfg.Exchange, h.logger.Logger)
-	h.pool.SetPriceHandler(h.handlePriceUpdate)
+	h.pool.SetPriceHandler(h.processor.ProcessPrice)
 	
 	// Register default handlers
 	h.RegisterHandler(h.publishToNATS)
@@ -120,12 +139,20 @@ func (h *Hub) Start(ctx context.Context) error {
 	// Start InfluxDB batcher
 	h.influxBatcher.Start()
 	
+	// Start price processor
+	h.processor.Start()
+	
 	// Start connection pool
 	if err := h.pool.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start connection pool: %w", err)
 	}
 	
 	h.running.Store(true)
+	
+	// Start dynamic symbol manager
+	if err := h.dynamicSymbols.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start dynamic symbol manager: %w", err)
+	}
 	
 	// Start statistics updater
 	h.wg.Add(1)
@@ -154,10 +181,16 @@ func (h *Hub) Stop() error {
 	close(h.done)
 	h.running.Store(false)
 	
+	// Stop dynamic symbol manager
+	h.dynamicSymbols.Stop()
+	
 	// Stop connection pool
 	if err := h.pool.Stop(); err != nil {
 		h.logger.WithError(err).Error("Failed to stop connection pool")
 	}
+	
+	// Stop price processor
+	h.processor.Stop()
 	
 	// Stop InfluxDB batcher
 	h.influxBatcher.Stop()

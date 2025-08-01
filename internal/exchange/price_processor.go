@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/trade-back/internal/models"
+	"github.com/trade-back/pkg/models"
 )
 
 // PriceProcessor handles price updates with rate limiting and batching
@@ -117,7 +117,7 @@ func (pp *PriceProcessor) processBatch(batch []*models.PriceData) {
 	symbolPrices := make(map[string]*models.PriceData)
 	for _, price := range batch {
 		// Keep only the latest price for each symbol
-		if existing, ok := symbolPrices[price.Symbol]; !ok || price.UpdateTime > existing.UpdateTime {
+		if existing, ok := symbolPrices[price.Symbol]; !ok || price.Timestamp.After(existing.Timestamp) {
 			symbolPrices[price.Symbol] = price
 		}
 	}

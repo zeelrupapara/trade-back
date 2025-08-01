@@ -3,6 +3,7 @@ package aggregation
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -245,44 +246,58 @@ func (oa *OHLCVAggregator) checkCompletedBars() {
 		delete(oa.activeBars, key)
 	}
 	
-	// Store completed bars
+	// Store completed bars - the resolutions were already captured when we created the bars
 	if len(completedBars) > 0 {
-		go oa.storeCompletedBars(completedBars)
+		// Create a simple wrapper with resolutions  
+		// We need to track resolutions before deleting
+		barData := make([]struct {
+			Bar        *models.Bar
+			Resolution string
+		}, 0, len(completedBars))
+		
+		// Re-scan to get resolutions (this is safe since we're still under lock)
+		for i, bar := range completedBars {
+			// Find resolution from the original key that was deleted
+			resolution := "1m" // default
+			if i < len(keysToDelete) {
+				// Extract resolution from key format: "symbol:resolution:timestamp"
+				parts := strings.Split(keysToDelete[i], ":")
+				if len(parts) >= 2 {
+					resolution = parts[1]
+				}
+			}
+			barData = append(barData, struct {
+				Bar        *models.Bar
+				Resolution string
+			}{Bar: bar, Resolution: resolution})
+		}
+		
+		go oa.storeCompletedBarsStructured(barData)
 	}
 }
 
-// storeCompletedBars stores completed bars to InfluxDB
-func (oa *OHLCVAggregator) storeCompletedBars(bars []*models.Bar) {
+// storeCompletedBarsStructured stores completed bars to InfluxDB with their resolutions
+func (oa *OHLCVAggregator) storeCompletedBarsStructured(barData []struct {
+	Bar        *models.Bar
+	Resolution string
+}) {
 	ctx := context.Background()
 	
-	for _, bar := range bars {
-		// Determine resolution from the first bar builder
-		var resolution string
-		for _, builder := range oa.activeBars {
-			if builder.Symbol == bar.Symbol {
-				resolution = builder.Resolution
-				break
-			}
-		}
-		
-		if resolution == "" {
-			// Try to infer from bar timestamp
-			resolution = "1m" // Default
-		}
-		
-		if err := oa.influx.WriteBar(ctx, bar, resolution); err != nil {
+	// Store the bars
+	for _, data := range barData {
+		if err := oa.influx.WriteBar(ctx, data.Bar, data.Resolution); err != nil {
 			oa.logger.WithError(err).WithFields(logrus.Fields{
-				"symbol":     bar.Symbol,
-				"resolution": resolution,
-				"timestamp":  bar.Timestamp,
+				"symbol":     data.Bar.Symbol,
+				"resolution": data.Resolution,
+				"timestamp":  data.Bar.Timestamp,
 			}).Error("Failed to store bar")
 		} else {
 			oa.logger.WithFields(logrus.Fields{
-				"symbol":     bar.Symbol,
-				"resolution": resolution,
-				"timestamp":  bar.Timestamp,
-				"close":      bar.Close,
-				"volume":     bar.Volume,
+				"symbol":     data.Bar.Symbol,
+				"resolution": data.Resolution,
+				"timestamp":  data.Bar.Timestamp,
+				"close":      data.Bar.Close,
+				"volume":     data.Bar.Volume,
 			}).Debug("Bar stored")
 		}
 	}
@@ -314,7 +329,19 @@ func (oa *OHLCVAggregator) completeAllBars() {
 	
 	// Store completed bars
 	if len(completedBars) > 0 {
-		oa.storeCompletedBars(completedBars)
+		// We need to pass resolutions, but the bars are already complete
+		// Just use a default resolution
+		barData := make([]struct {
+			Bar        *models.Bar
+			Resolution string
+		}, 0, len(completedBars))
+		for _, bar := range completedBars {
+			barData = append(barData, struct {
+				Bar        *models.Bar
+				Resolution string
+			}{Bar: bar, Resolution: "1m"})
+		}
+		oa.storeCompletedBarsStructured(barData)
 	}
 }
 

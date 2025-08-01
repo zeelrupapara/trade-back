@@ -28,8 +28,8 @@ func NewMySQLClient(cfg *config.MySQLConfig, logger *logrus.Logger) (*MySQLClien
 		cfg.Port,
 		cfg.Database,
 	)
-
-	fmt.Println(dsn)
+	
+	logger.WithField("dsn", fmt.Sprintf("%s:***@tcp(%s:%d)/%s", cfg.Username, cfg.Host, cfg.Port, cfg.Database)).Debug("Connecting to MySQL")
 	
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -78,6 +78,14 @@ func (mc *MySQLClient) Health(ctx context.Context) error {
 
 // GetSymbols retrieves all active symbols
 func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, error) {
+	mc.logger.Info("GetSymbols called - START")
+	
+	// Check if db connection exists
+	if mc.db == nil {
+		mc.logger.Error("Database connection is nil")
+		return nil, fmt.Errorf("database connection is nil")
+	}
+	
 	query := `
 		SELECT id, exchange, symbol, full_name, instrument_type, 
 		       base_currency, quote_currency, is_active, 
@@ -88,14 +96,20 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 		ORDER BY symbol
 	`
 	
+	mc.logger.Info("Executing symbols query")
 	rows, err := mc.db.QueryContext(ctx, query)
 	if err != nil {
+		mc.logger.WithError(err).Error("Failed to query symbols")
 		return nil, fmt.Errorf("failed to query symbols: %w", err)
 	}
 	defer rows.Close()
 	
+	mc.logger.Info("Query executed successfully, scanning rows...")
+	
 	var symbols []*models.SymbolInfo
+	rowCount := 0
 	for rows.Next() {
+		rowCount++
 		symbol := &models.SymbolInfo{}
 		err := rows.Scan(
 			&symbol.ID,
@@ -112,12 +126,24 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 			&symbol.UpdatedAt,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan symbol: %w", err)
+			mc.logger.WithError(err).WithField("row", rowCount).Error("Failed to scan symbol")
+			return nil, fmt.Errorf("failed to scan symbol at row %d: %w", rowCount, err)
 		}
 		symbols = append(symbols, symbol)
+		
+		// Log every 100 rows
+		if rowCount % 100 == 0 {
+			mc.logger.WithField("rows_scanned", rowCount).Debug("Scanning rows...")
+		}
 	}
 	
-	return symbols, rows.Err()
+	if err := rows.Err(); err != nil {
+		mc.logger.WithError(err).Error("Error iterating rows")
+		return nil, err
+	}
+	
+	mc.logger.WithField("count", len(symbols)).Info("GetSymbols completed successfully")
+	return symbols, nil
 }
 
 // GetSymbol retrieves a single symbol by exchange and symbol name
