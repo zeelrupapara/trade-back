@@ -1,0 +1,27 @@
+[Unit]
+Description=Trade Back High-Performance Trading Backend
+After=network.target mysql.service redis.service
+
+[Service]
+Type=simple
+User=jeel
+WorkingDirectory=/home/jeel/workspace/go-workspace/src/github.com/trade-back
+ExecStart=/home/jeel/workspace/go-workspace/src/github.com/trade-back/trade-back server
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Environment
+Environment="GOMAXPROCS=4"
+EnvironmentFile=-/home/jeel/workspace/go-workspace/src/github.com/trade-back/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trade-back
+
+[Install]
+WantedBy=multi-user.target

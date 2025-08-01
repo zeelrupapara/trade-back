@@ -1,0 +1,122 @@
+# Development Docker Compose Configuration
+# Uses .env file for environment variables
+#
+# Usage:
+#   docker-compose -f docker-compose.dev.yml up -d
+#
+# The .env file is automatically loaded by docker-compose
+
+services:
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: trade-back-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-trading}
+      MYSQL_USER: ${MYSQL_USER:-trading}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-trading123}
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # InfluxDB Time-Series Database
+  influxdb:
+    image: influxdb:2.7
+    container_name: trade-back-influxdb
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: ${DOCKER_INFLUXDB_INIT_MODE:-setup}
+      DOCKER_INFLUXDB_INIT_USERNAME: ${DOCKER_INFLUXDB_INIT_USERNAME:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${DOCKER_INFLUXDB_INIT_PASSWORD:-admin123456}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-trading-org}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-trading}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-my-super-secret-auth-token}
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: trade-back-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # NATS Messaging
+  nats:
+    image: nats:2.10
+    container_name: trade-back-nats
+    command: ["-js", "-c", "/etc/nats.conf"]
+    ports:
+      - "4222:4222"  # Client connections
+      - "8222:8222"  # HTTP monitoring
+    volumes:
+      - ./configs/nats.conf:/etc/nats.conf:ro
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # phpMyAdmin for MySQL management (optional)
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: trade-back-phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: trading
+      PMA_PASSWORD: trading123
+    ports:
+      - "8090:80"
+    depends_on:
+      - mysql
+    profiles:
+      - tools
+
+  # RedisInsight for Redis management (optional)
+  redisinsight:
+    image: redislabs/redisinsight:latest
+    container_name: trade-back-redisinsight
+    ports:
+      - "8001:8001"
+    volumes:
+      - redisinsight_data:/db
+    depends_on:
+      - redis
+    profiles:
+      - tools
+
+volumes:
+  mysql_data:
+  influxdb_data:
+  influxdb_config:
+  redis_data:
+  nats_data:
+  redisinsight_data:
+
+networks:
+  default:
+    name: trade-back-network

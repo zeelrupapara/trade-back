@@ -1,0 +1,40 @@
+-- Migration: Insert Default Data
+-- Created: 2024-12-25 00:00:02
+
+-- +migrate Up
+-- Insert default data for trading system
+
+-- Insert trading sessions
+INSERT IGNORE INTO trading_sessions (name, start_time, end_time, timezone, days_active) VALUES
+('Asian', '00:00:00', '08:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]'),
+('London', '08:00:00', '16:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday"]'),
+('New York', '13:00:00', '21:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday"]'),
+('Crypto 24/7', '00:00:00', '23:59:59', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]');
+
+-- Insert default system configurations
+INSERT IGNORE INTO system_config (config_key, config_value, description) VALUES
+('max_symbols_per_connection', '200', 'Maximum symbols per WebSocket connection to exchange'),
+('price_update_interval_ms', '100', 'Minimum interval between price updates in milliseconds'),
+('connection_timeout_seconds', '30', 'WebSocket connection timeout in seconds'),
+('max_reconnect_attempts', '10', 'Maximum reconnection attempts before giving up'),
+('cache_ttl_seconds', '300', 'Redis cache TTL in seconds'),
+('enigma_calculation_interval', '5', 'Enigma levels calculation interval in seconds'),
+('binary_protocol_enabled', 'true', 'Enable binary protocol for WebSocket connections'),
+('batch_size', '50', 'Number of price updates to batch together'),
+('batch_interval_ms', '50', 'Interval in milliseconds to send batched updates');
+
+-- +migrate Down
+-- Remove default data
+DELETE FROM system_config WHERE config_key IN (
+    'max_symbols_per_connection',
+    'price_update_interval_ms', 
+    'connection_timeout_seconds',
+    'max_reconnect_attempts',
+    'cache_ttl_seconds',
+    'enigma_calculation_interval',
+    'binary_protocol_enabled',
+    'batch_size',
+    'batch_interval_ms'
+);
+
+DELETE FROM trading_sessions WHERE name IN ('Asian', 'London', 'New York', 'Crypto 24/7');

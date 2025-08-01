@@ -1,0 +1,120 @@
+# Production Docker Compose Configuration
+# For development, use docker-compose.dev.yml
+#
+# Usage for production:
+#   cp .env.docker .env  # or use --env-file .env.docker
+#   docker-compose up -d
+#
+# Or directly:
+#   docker-compose --env-file .env.docker up -d
+
+services:
+  # Main Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trade-back-app
+    env_file:
+      - .env.docker
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - trade-back-network
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: trade-back-mysql-prod
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - trade-back-network
+
+  # InfluxDB Time-Series Database
+  influxdb:
+    image: influxdb:2.7
+    container_name: trade-back-influxdb-prod
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: ${DOCKER_INFLUXDB_INIT_MODE}
+      DOCKER_INFLUXDB_INIT_USERNAME: ${DOCKER_INFLUXDB_INIT_USERNAME}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${DOCKER_INFLUXDB_INIT_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${DOCKER_INFLUXDB_INIT_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${DOCKER_INFLUXDB_INIT_BUCKET}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${DOCKER_INFLUXDB_INIT_ADMIN_TOKEN}
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - trade-back-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: trade-back-redis-prod
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - trade-back-network
+
+  # NATS Messaging
+  nats:
+    image: nats:2.10
+    container_name: trade-back-nats-prod
+    command: ["-js", "-c", "/etc/nats.conf"]
+    volumes:
+      - ./configs/nats.conf:/etc/nats.conf:ro
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - trade-back-network
+
+volumes:
+  mysql_data:
+  influxdb_data:
+  influxdb_config:
+  redis_data:
+  nats_data:
+
+networks:
+  trade-back-network:
+    driver: bridge

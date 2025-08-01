@@ -1,0 +1,112 @@
+# Binaries and build artifacts
+/trade-back
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go specific
+vendor/
+go.sum
+*.mod.backup
+
+# Environment files
+.env
+.env.local
+.env.*.local
+# Keep .env.docker as it's a template
+!.env.docker
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-workspace
+*.sublime-project
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Test coverage
+*.cover
+*.coverprofile
+coverage.txt
+coverage.html
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.pid
+
+# Docker volumes (local development)
+mysql_data/
+influxdb_data/
+influxdb_config/
+redis_data/
+nats_data/
+redisinsight_data/
+
+# Config files with sensitive data
+config.local.yaml
+config.prod.yaml
+secrets/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+.Trash-*
+
+# Node modules (if any frontend tools are used)
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Archive files
+*.tar
+*.tar.gz
+*.zip
+*.rar
+
+# SSL certificates
+*.pem
+*.key
+*.crt
+*.csr
+
+# Binary data files
+*.bin
+*.dat
