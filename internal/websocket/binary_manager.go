@@ -290,9 +290,15 @@ func (c *BinaryClient) WritePump() {
 				return
 			}
 			
-			// Send binary message
-			if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				c.manager.logger.WithError(err).Error("Binary write error")
+			// Check if it's JSON (control message) or binary data
+			messageType := websocket.BinaryMessage
+			// Simple check: if it starts with '{' it's likely JSON
+			if len(data) > 0 && data[0] == '{' {
+				messageType = websocket.TextMessage
+			}
+			
+			if err := c.conn.WriteMessage(messageType, data); err != nil {
+				c.manager.logger.WithError(err).Error("Write error")
 				return
 			}
 			
@@ -448,6 +454,12 @@ func (bm *BinaryManager) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 	clientID := fmt.Sprintf("client-%d", time.Now().UnixNano())
 	client := NewBinaryClient(clientID, sessionToken, conn, bm)
 	
+	bm.logger.WithFields(logrus.Fields{
+		"clientID": clientID,
+		"sessionToken": sessionToken,
+		"hasToken": sessionToken != "",
+	}).Info("New WebSocket client connected")
+	
 	// Register client
 	bm.RegisterClient(client)
 	
@@ -598,7 +610,9 @@ func (bm *BinaryManager) AutoSubscribeSymbol(sessionToken, symbol string) {
 			// Send subscribe message to client
 			msg := map[string]interface{}{
 				"type": "auto_subscribe",
-				"symbol": symbol,
+				"data": map[string]interface{}{
+					"symbol": symbol,
+				},
 			}
 			
 			if data, err := json.Marshal(msg); err == nil {
@@ -618,15 +632,31 @@ func (bm *BinaryManager) AutoSubscribeSymbol(sessionToken, symbol string) {
 
 // AutoUnsubscribeSymbol automatically unsubscribes all clients with the given session token from a symbol
 func (bm *BinaryManager) AutoUnsubscribeSymbol(sessionToken, symbol string) {
+	bm.logger.WithFields(logrus.Fields{
+		"sessionToken": sessionToken,
+		"symbol": symbol,
+		"clientCount": len(bm.clients),
+	}).Info("AutoUnsubscribeSymbol called")
+	
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
 	
+	clientsFound := 0
 	for client := range bm.clients {
+		bm.logger.WithFields(logrus.Fields{
+			"clientToken": client.sessionToken,
+			"targetToken": sessionToken,
+			"match": client.sessionToken == sessionToken,
+		}).Debug("Checking client for auto-unsubscribe")
+		
 		if client.sessionToken == sessionToken {
+			clientsFound++
 			// Send unsubscribe message to client
 			msg := map[string]interface{}{
 				"type": "auto_unsubscribe",
-				"symbol": symbol,
+				"data": map[string]interface{}{
+					"symbol": symbol,
+				},
 			}
 			
 			if data, err := json.Marshal(msg); err == nil {
@@ -640,6 +670,12 @@ func (bm *BinaryManager) AutoUnsubscribeSymbol(sessionToken, symbol string) {
 			}
 		}
 	}
+	
+	bm.logger.WithFields(logrus.Fields{
+		"sessionToken": sessionToken,
+		"symbol": symbol,
+		"clientsMatched": clientsFound,
+	}).Info("AutoUnsubscribeSymbol completed")
 }
 
 // autoSubscribeMarketWatch automatically subscribes a client to their market watch symbols

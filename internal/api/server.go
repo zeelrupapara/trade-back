@@ -669,7 +669,21 @@ func (s *Server) handleRemoveFromMarketWatch(w http.ResponseWriter, r *http.Requ
 	}
 	
 	// Notify all WebSocket clients with the same session token to auto-unsubscribe
-	s.wsManager.AutoUnsubscribeSymbol(token, symbol)
+	s.logger.WithFields(logrus.Fields{
+		"token": token,
+		"symbol": symbol,
+		"wsManager": s.wsManager != nil,
+	}).Info("Calling AutoUnsubscribeSymbol")
+	
+	if s.wsManager != nil {
+		s.wsManager.AutoUnsubscribeSymbol(token, symbol)
+		s.logger.WithFields(logrus.Fields{
+			"token": token,
+			"symbol": symbol,
+		}).Info("Called AutoUnsubscribeSymbol successfully")
+	} else {
+		s.logger.Error("WebSocket manager is nil, cannot send auto-unsubscribe")
+	}
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
