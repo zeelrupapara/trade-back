@@ -117,7 +117,7 @@ func (dsm *DynamicSymbolManager) updateSubscriptions(ctx context.Context) error 
 			"removing":  toRemove,
 			"add_count": len(toAdd),
 			"remove_count": len(toRemove),
-		}).Info("Updating symbol subscriptions")
+		}).Debug("Updating symbol subscriptions")
 		
 		// Update subscribed symbols map
 		for _, symbol := range toAdd {
@@ -178,7 +178,7 @@ func (dsm *DynamicSymbolManager) getAllMarketWatchSymbols(ctx context.Context) (
 		}
 	}
 	
-	dsm.logger.WithField("unique_symbols", len(uniqueSymbols)).Info("Collected market watch symbols")
+	dsm.logger.WithField("unique_symbols", len(uniqueSymbols)).Debug("Collected market watch symbols")
 	return uniqueSymbols, nil
 }
 

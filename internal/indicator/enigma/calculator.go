@@ -418,7 +418,7 @@ func (ec *Calculator) loadHistoricalExtremes(ctx context.Context) error {
 			"ath":    fmt.Sprintf("%.8f", ath),
 			"atl":    fmt.Sprintf("%.8f", atl),
 			"range":  fmt.Sprintf("%.2f%%", ((ath-atl)/atl)*100),
-		}).Info("Loaded historical ATH/ATL")
+		}).Debug("Loaded historical ATH/ATL")
 	}
 	
 	if loadedCount > 0 {

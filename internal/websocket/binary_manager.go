@@ -550,7 +550,7 @@ func (c *BinaryClient) handleTextMessage(data []byte) {
 		c.manager.logger.WithFields(logrus.Fields{
 			"client":  c.id,
 			"symbols": msg.Symbols,
-		}).Info("Client subscribed")
+		}).Debug("Client subscribed")
 		
 		// Send current prices for subscribed symbols
 		go c.sendCurrentPrices(msg.Symbols)
@@ -560,7 +560,7 @@ func (c *BinaryClient) handleTextMessage(data []byte) {
 		c.manager.logger.WithFields(logrus.Fields{
 			"client":  c.id,
 			"symbols": msg.Symbols,
-		}).Info("Client unsubscribed")
+		}).Debug("Client unsubscribed")
 		
 	case "ping":
 		// Send pong
@@ -636,7 +636,7 @@ func (bm *BinaryManager) AutoUnsubscribeSymbol(sessionToken, symbol string) {
 		"sessionToken": sessionToken,
 		"symbol": symbol,
 		"clientCount": len(bm.clients),
-	}).Info("AutoUnsubscribeSymbol called")
+	}).Debug("AutoUnsubscribeSymbol called")
 	
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
@@ -675,7 +675,7 @@ func (bm *BinaryManager) AutoUnsubscribeSymbol(sessionToken, symbol string) {
 		"sessionToken": sessionToken,
 		"symbol": symbol,
 		"clientsMatched": clientsFound,
-	}).Info("AutoUnsubscribeSymbol completed")
+	}).Debug("AutoUnsubscribeSymbol completed")
 }
 
 // autoSubscribeMarketWatch automatically subscribes a client to their market watch symbols
@@ -716,7 +716,7 @@ func (bm *BinaryManager) autoSubscribeMarketWatch(client *BinaryClient) {
 				"client": client.id,
 				"symbols": symbols,
 				"count": len(symbols),
-			}).Info("Auto-subscribed to market watch symbols")
+			}).Debug("Auto-subscribed to market watch symbols")
 		default:
 			// Client buffer full
 		}

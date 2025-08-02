@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -393,19 +394,147 @@ func (s *Server) handleGetBars(w http.ResponseWriter, r *http.Request) {
 		resolution = "1m"
 	}
 	
+	// Convert frontend resolution format to backend format
+	// Frontend sends: 1m, 5m, 15m, 1h, 1Dm, etc.
+	// Backend expects: 1m, 5m, 15m, 1h, 1d, etc.
+	if strings.HasSuffix(resolution, "Dm") {
+		// Daily resolution from frontend (e.g., "1Dm" -> "1d")
+		resolution = strings.TrimSuffix(resolution, "m")
+		resolution = strings.ToLower(resolution)
+	}
+	
+	// Get time range parameters
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+	
+	// Parse timestamps
+	var from, to time.Time
+	if fromStr != "" {
+		fromUnix, err := strconv.ParseInt(fromStr, 10, 64)
+		if err != nil {
+			http.Error(w, "Invalid from timestamp", http.StatusBadRequest)
+			return
+		}
+		from = time.Unix(fromUnix, 0)
+	} else {
+		// Default to 24 hours ago
+		from = time.Now().Add(-24 * time.Hour)
+	}
+	
+	if toStr != "" {
+		toUnix, err := strconv.ParseInt(toStr, 10, 64)
+		if err != nil {
+			http.Error(w, "Invalid to timestamp", http.StatusBadRequest)
+			return
+		}
+		to = time.Unix(toUnix, 0)
+	} else {
+		// Default to now
+		to = time.Now()
+	}
+	
+	// Swap if from > to
+	if from.After(to) {
+		from, to = to, from
+	}
+	
+	// Log the request for debugging
+	s.logger.WithFields(logrus.Fields{
+		"symbol":     symbol,
+		"resolution": resolution,
+		"from":       from.Format(time.RFC3339),
+		"to":         to.Format(time.RFC3339),
+		"fromUnix":   from.Unix(),
+		"toUnix":     to.Unix(),
+	}).Debug("Getting bars")
+	
 	// Try cache first
-	bars, err := s.redisCache.GetBars(context.Background(), symbol, resolution)
-	if err == nil && bars != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"bars": bars,
-		})
-		return
+	ctx := context.Background()
+	bars, err := s.redisCache.GetBars(ctx, symbol, resolution)
+	if err == nil && bars != nil && len(bars) > 0 {
+		// Filter bars by time range
+		filteredBars := make([]*models.Bar, 0)
+		for _, bar := range bars {
+			if bar.Timestamp.Unix() >= from.Unix() && bar.Timestamp.Unix() <= to.Unix() {
+				filteredBars = append(filteredBars, bar)
+			}
+		}
+		if len(filteredBars) > 0 {
+			// Convert bars to TradingView format
+			tvBars := make([]map[string]interface{}, len(filteredBars))
+			for i, bar := range filteredBars {
+				tvBars[i] = map[string]interface{}{
+					"time":   bar.Timestamp.Unix() * 1000, // TradingView expects milliseconds
+					"open":   bar.Open,
+					"high":   bar.High,
+					"low":    bar.Low,
+					"close":  bar.Close,
+					"volume": bar.Volume,
+				}
+			}
+			
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"bars": tvBars,
+			})
+			return
+		}
 	}
 	
 	// Fetch from InfluxDB
-	// Implementation depends on your time range parameters
+	if s.influxDB != nil {
+		s.logger.WithFields(logrus.Fields{
+			"symbol":     symbol,
+			"resolution": resolution,
+			"from":       from.Format(time.RFC3339),
+			"to":         to.Format(time.RFC3339),
+		}).Debug("Fetching bars from InfluxDB")
+		
+		bars, err := s.influxDB.GetBars(ctx, symbol, from, to, resolution)
+		if err != nil {
+			s.logger.WithError(err).Error("Failed to get bars from InfluxDB")
+			http.Error(w, "Failed to retrieve historical data", http.StatusInternalServerError)
+			return
+		}
+		
+		s.logger.WithFields(logrus.Fields{
+			"symbol":     symbol,
+			"resolution": resolution,
+			"bar_count":  len(bars),
+		}).Debug("Retrieved bars from InfluxDB")
+		
+		// Cache the results for future requests
+		if len(bars) > 0 {
+			go func() {
+				if err := s.redisCache.SetBars(context.Background(), symbol, resolution, bars); err != nil {
+					s.logger.WithError(err).Warn("Failed to cache bars")
+				}
+			}()
+		}
+		
+		// Convert bars to TradingView format
+		tvBars := make([]map[string]interface{}, len(bars))
+		for i, bar := range bars {
+			tvBars[i] = map[string]interface{}{
+				"time":   bar.Timestamp.Unix() * 1000, // TradingView expects milliseconds
+				"open":   bar.Open,
+				"high":   bar.High,
+				"low":    bar.Low,
+				"close":  bar.Close,
+				"volume": bar.Volume,
+			}
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"bars": tvBars,
+		})
+		return
+	} else {
+		s.logger.Error("InfluxDB client is nil")
+	}
 	
+	// No data available
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"bars": []interface{}{},

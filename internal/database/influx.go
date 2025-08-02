@@ -165,6 +165,16 @@ func (ic *InfluxClient) GetBars(ctx context.Context, symbol string, from, to tim
 			|> sort(columns: ["_time"])
 	`, ic.bucket, from.Format(time.RFC3339), to.Format(time.RFC3339), measurement, symbol)
 	
+	// Log the query for debugging
+	ic.logger.WithFields(logrus.Fields{
+		"measurement": measurement,
+		"symbol":      symbol,
+		"from":        from.Format(time.RFC3339),
+		"to":          to.Format(time.RFC3339),
+		"bucket":      ic.bucket,
+		"query":       query,
+	}).Debug("Executing InfluxDB query for bars")
+	
 	result, err := ic.queryAPI.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query bars: %w", err)
