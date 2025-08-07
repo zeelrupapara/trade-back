@@ -13,9 +13,11 @@ import (
 	"github.com/trade-back/internal/api"
 	"github.com/trade-back/internal/cache"
 	"github.com/trade-back/internal/database"
+	"github.com/trade-back/internal/external"
 	"github.com/trade-back/internal/indicator/enigma"
 	"github.com/trade-back/internal/exchange"
 	"github.com/trade-back/internal/messaging"
+	"github.com/trade-back/internal/services"
 	"github.com/trade-back/internal/session"
 	"github.com/trade-back/internal/symbols"
 	"github.com/trade-back/internal/websocket"
@@ -40,10 +42,13 @@ type App struct {
 	symbolsMgr   *symbols.Manager
 	
 	// Services
-	enigmaCalc   *enigma.Calculator
-	ohlcvAgg     *aggregation.OHLCVAggregator
-	sessionMgr   *session.Manager
-	apiServer    *api.Server
+	enigmaCalc       *enigma.Calculator
+	ohlcvAgg         *aggregation.OHLCVAggregator
+	sessionMgr       *session.Manager
+	apiServer        *api.Server
+	historicalLoader *services.OptimizedHistoricalLoader
+	instantEnigma    *services.InstantEnigmaService
+	coingecko        *external.CoinGeckoClient
 }
 
 // New creates a new application instance
@@ -60,8 +65,6 @@ func New(cfg *config.Config, logger *logrus.Logger) *App {
 
 // Initialize initializes all application components
 func (a *App) Initialize() error {
-	a.logger.Info("Initializing application components...")
-	
 	// Initialize database connections
 	if err := a.initializeDatabase(); err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
@@ -97,14 +100,12 @@ func (a *App) Initialize() error {
 		return fmt.Errorf("failed to initialize API server: %w", err)
 	}
 	
-	a.logger.Info("Application initialized successfully")
+	// a.logger.Info("Application initialized successfully")
 	return nil
 }
 
 // Start starts the application
 func (a *App) Start() error {
-	a.logger.Info("Starting application...")
-	
 	// Start price hub
 	if err := a.hub.Start(a.ctx); err != nil {
 		return fmt.Errorf("failed to start hub: %w", err)
@@ -145,7 +146,18 @@ func (a *App) Start() error {
 		}
 	}()
 	
-	a.logger.Info("Application started successfully")
+	// Resume any incomplete historical data syncs
+	if a.historicalLoader != nil {
+		go func() {
+			// Wait a bit for services to stabilize
+			time.Sleep(5 * time.Second)
+			if err := a.historicalLoader.ResumeIncompleteSync(a.ctx); err != nil {
+				a.logger.WithError(err).Warn("Failed to resume incomplete syncs")
+			}
+		}()
+	}
+	
+	// a.logger.Info("Application started successfully")
 	return nil
 }
 
@@ -156,8 +168,26 @@ func (a *App) Stop() error {
 	// Cancel context to signal shutdown
 	a.cancel()
 	
-	// Wait for all goroutines to finish
-	a.wg.Wait()
+	// Create a channel to signal when goroutines are done
+	done := make(chan struct{})
+	
+	// Wait for goroutines in a separate goroutine
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	
+	// Wait for goroutines with timeout (3 seconds)
+	select {
+	case <-done:
+		// All goroutines finished
+		a.logger.Info("All goroutines stopped")
+	case <-time.After(3 * time.Second):
+		a.logger.Warn("Timeout waiting for goroutines to finish")
+	}
+	
+	// Stop services with individual timeouts
+	a.stopServicesWithTimeout()
 	
 	// Close connections
 	if err := a.closeConnections(); err != nil {
@@ -166,6 +196,46 @@ func (a *App) Stop() error {
 	
 	a.logger.Info("Application stopped successfully")
 	return nil
+}
+
+// stopServicesWithTimeout stops each service with a timeout
+func (a *App) stopServicesWithTimeout() {
+	// Stop API server with timeout
+	if a.apiServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := a.apiServer.Stop(ctx); err != nil {
+			a.logger.WithError(err).Error("Error stopping API server")
+		}
+		cancel()
+	}
+	
+	// Stop hub
+	if a.hub != nil {
+		if err := a.hub.Stop(); err != nil {
+			a.logger.WithError(err).Error("Error stopping hub")
+		}
+	}
+	
+	// Stop session manager
+	if a.sessionMgr != nil {
+		if err := a.sessionMgr.Stop(); err != nil {
+			a.logger.WithError(err).Error("Error stopping session manager")
+		}
+	}
+	
+	// Stop OHLCV aggregator
+	if a.ohlcvAgg != nil {
+		if err := a.ohlcvAgg.Stop(); err != nil {
+			a.logger.WithError(err).Error("Error stopping OHLCV aggregator")
+		}
+	}
+	
+	// Stop Enigma calculator
+	if a.enigmaCalc != nil {
+		if err := a.enigmaCalc.Stop(); err != nil {
+			a.logger.WithError(err).Error("Error stopping Enigma calculator")
+		}
+	}
 }
 
 // GetContext returns the application context
@@ -191,7 +261,6 @@ func (a *App) GetSymbolsManager() *symbols.Manager {
 // Private initialization methods
 
 func (a *App) initializeDatabase() error {
-	a.logger.Info("Initializing database connections...")
 	
 	// Initialize MySQL
 	mysqlClient, err := database.NewMySQLClient(&a.cfg.Database.MySQL, a.logger)
@@ -212,7 +281,6 @@ func (a *App) initializeDatabase() error {
 }
 
 func (a *App) initializeSymbols() error {
-	a.logger.Info("Initializing symbols manager...")
 	
 	// Create symbols manager
 	a.symbolsMgr = symbols.NewManager(a.mysqlDB, a.logger)
@@ -231,7 +299,6 @@ func (a *App) initializeSymbols() error {
 }
 
 func (a *App) initializeCache() error {
-	a.logger.Info("Initializing cache...")
 	
 	redisClient, err := cache.NewRedisClient(&a.cfg.Cache.Redis, a.logger)
 	if err != nil {
@@ -246,7 +313,6 @@ func (a *App) initializeCache() error {
 }
 
 func (a *App) initializeMessaging() error {
-	a.logger.Info("Initializing messaging system...")
 	
 	natsClient, err := messaging.NewNATSClient(&a.cfg.Messaging.NATS, a.logger)
 	if err != nil {
@@ -258,7 +324,6 @@ func (a *App) initializeMessaging() error {
 }
 
 func (a *App) initializeExchange() error {
-	a.logger.Info("Initializing exchange connections...")
 	
 	// Create hub
 	a.hub = exchange.NewHub(a.cfg, a.logger)
@@ -279,13 +344,13 @@ func (a *App) initializeExchange() error {
 }
 
 func (a *App) initializeWebSocket() error {
-	a.logger.Info("Initializing WebSocket manager...")
 	
 	// Create binary WebSocket manager
 	a.wsManager = websocket.NewBinaryManager(
 		a.hub,
 		a.natsClient,
 		a.redisCache,
+		a.mysqlDB,
 		a.logger,
 	)
 	
@@ -296,7 +361,26 @@ func (a *App) initializeWebSocket() error {
 }
 
 func (a *App) initializeAPIServer() error {
-	a.logger.Info("Initializing API server...")
+	
+	// Create historical loader
+	a.historicalLoader = services.NewOptimizedHistoricalLoader(
+		a.influxDB,
+		a.mysqlDB,
+		a.natsClient,
+		a.logger,
+	)
+	
+	// Create CoinGecko client (empty API key for free tier)
+	a.coingecko = external.NewCoinGeckoClient("", a.logger)
+	
+	// Create instant Enigma service
+	a.instantEnigma = services.NewInstantEnigmaService(
+		a.coingecko,
+		a.influxDB,
+		a.redisCache,
+		a.natsClient,
+		a.logger,
+	)
 	
 	// Create API server
 	a.apiServer = api.NewServer(
@@ -308,13 +392,15 @@ func (a *App) initializeAPIServer() error {
 		a.natsClient,
 		a.enigmaCalc,
 		a.wsManager,
+		a.historicalLoader,
+		a.instantEnigma,
+		a.hub,
 	)
 	
 	return nil
 }
 
 func (a *App) closeConnections() error {
-	a.logger.Info("Closing connections...")
 	
 	var errs []error
 	
