@@ -58,7 +58,11 @@ func (ic *InfluxClient) Health(ctx context.Context) error {
 	}
 	
 	if health.Status != "pass" {
-		return fmt.Errorf("influxdb health check failed: %s", health.Message)
+		msg := ""
+		if health.Message != nil {
+			msg = *health.Message
+		}
+		return fmt.Errorf("influxdb health check failed: %s", msg)
 	}
 	
 	return nil
@@ -146,6 +150,47 @@ func (ic *InfluxClient) WriteBar(ctx context.Context, bar *models.Bar, resolutio
 	
 	if err := ic.writeAPI.WritePoint(ctx, point); err != nil {
 		return fmt.Errorf("failed to write bar data: %w", err)
+	}
+	
+	return nil
+}
+
+// WriteBars writes multiple OHLCV bars in an optimized batch
+func (ic *InfluxClient) WriteBars(ctx context.Context, bars []*models.Bar, resolution string) error {
+	if len(bars) == 0 {
+		return nil
+	}
+	
+	measurement := fmt.Sprintf("ohlcv_%s", resolution)
+	
+	// Use the blocking write API for better performance with large batches
+	writeAPI := ic.client.WriteAPIBlocking(ic.org, ic.bucket)
+	
+	points := make([]*write.Point, 0, len(bars))
+	for _, bar := range bars {
+		point := influxdb2.NewPoint(
+			measurement,
+			map[string]string{
+				"exchange": "binance",
+				"symbol":   bar.Symbol,
+			},
+			map[string]interface{}{
+				"open":        bar.Open,
+				"high":        bar.High,
+				"low":         bar.Low,
+				"close":       bar.Close,
+				"volume":      bar.Volume,
+				"trade_count": bar.TradeCount,
+			},
+			bar.Timestamp,
+		)
+		points = append(points, point)
+	}
+	
+	// Write all points in a single batch operation
+	// This is much faster than writing points individually
+	if err := writeAPI.WritePoint(ctx, points...); err != nil {
+		return fmt.Errorf("failed to write bars batch (%d points): %w", len(points), err)
 	}
 	
 	return nil
