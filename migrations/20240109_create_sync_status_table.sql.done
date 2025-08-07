@@ -1,0 +1,26 @@
+-- Create sync_status table to track historical data synchronization progress
+CREATE TABLE IF NOT EXISTS sync_status (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    symbol_id INT NOT NULL,
+    status ENUM('pending', 'syncing', 'completed', 'failed') NOT NULL DEFAULT 'pending',
+    progress INT NOT NULL DEFAULT 0,
+    total_bars INT NOT NULL DEFAULT 0,
+    error_message TEXT,
+    started_at TIMESTAMP NULL,
+    completed_at TIMESTAMP NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    UNIQUE KEY unique_symbol (symbol_id),
+    FOREIGN KEY (symbol_id) REFERENCES symbolsmap(id) ON DELETE CASCADE,
+    
+    INDEX idx_status (status),
+    INDEX idx_updated_at (updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Add indexes for performance
+ALTER TABLE sync_status ADD INDEX idx_status_progress (status, progress);
+
+-- Check and add sync columns to market_watch
+-- Note: MySQL doesn't support IF NOT EXISTS in ALTER TABLE ADD COLUMN before 8.0.29
+-- These columns may already exist from previous migrations
