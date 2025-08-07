@@ -34,10 +34,10 @@ func NewNATSClient(cfg *config.NATSConfig, logger *logrus.Logger) (*NATSClient, 
 			logger.WithError(err).Warn("NATS disconnected")
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			logger.Info("NATS reconnected")
+			// logger.Info("NATS reconnected")
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			logger.Info("NATS connection closed")
+			// logger.Info("NATS connection closed")
 		}),
 	}
 	
@@ -151,7 +151,7 @@ func (nc *NATSClient) initializeStreams() error {
 		return fmt.Errorf("failed to create SYSTEM stream: %w", err)
 	}
 	
-	nc.logger.Info("JetStream streams initialized")
+	// nc.logger.Info("JetStream streams initialized")
 	return nil
 }
 
@@ -446,4 +446,169 @@ func (nc *NATSClient) GetStats() nats.Statistics {
 // GetConn returns the underlying NATS connection
 func (nc *NATSClient) GetConn() *nats.Conn {
 	return nc.conn
+}
+
+// Sync operations
+
+// PublishSyncProgress publishes sync progress update
+func (nc *NATSClient) PublishSyncProgress(symbol string, progress int, totalBars int) error {
+	subject := fmt.Sprintf("sync.progress.%s", symbol)
+	data, err := json.Marshal(map[string]interface{}{
+		"symbol":    symbol,
+		"progress":  progress,
+		"totalBars": totalBars,
+		"timestamp": time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal sync progress: %w", err)
+	}
+	
+	// Log for debugging
+	nc.logger.WithFields(logrus.Fields{
+		"subject": subject,
+		"symbol": symbol,
+		"progress": progress,
+		"totalBars": totalBars,
+	}).Debug("Publishing sync progress to NATS")
+	
+	_, err = nc.js.Publish(subject, data)
+	if err != nil {
+		return fmt.Errorf("failed to publish sync progress: %w", err)
+	}
+	return nil
+}
+
+// PublishSyncComplete publishes sync completion notification
+func (nc *NATSClient) PublishSyncComplete(symbol string, totalBars int, startTime, endTime time.Time) error {
+	subject := fmt.Sprintf("sync.complete.%s", symbol)
+	data, err := json.Marshal(map[string]interface{}{
+		"symbol":    symbol,
+		"totalBars": totalBars,
+		"startTime": startTime,
+		"endTime":   endTime,
+		"timestamp": time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal sync complete: %w", err)
+	}
+	
+	_, err = nc.js.Publish(subject, data)
+	if err != nil {
+		return fmt.Errorf("failed to publish sync complete: %w", err)
+	}
+	return nil
+}
+
+// SubscribeSyncUpdates subscribes to sync progress updates
+func (nc *NATSClient) SubscribeSyncUpdates(handler func(string, int, int)) error {
+	subject := "sync.progress.*"
+	
+	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
+		var data map[string]interface{}
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
+			nc.logger.WithError(err).Error("Failed to unmarshal sync progress")
+			return
+		}
+		
+		symbol, _ := data["symbol"].(string)
+		progress := int(data["progress"].(float64))
+		totalBars := int(data["totalBars"].(float64))
+		
+		// Log for debugging
+		nc.logger.WithFields(logrus.Fields{
+			"subject": msg.Subject,
+			"symbol": symbol,
+			"progress": progress,
+			"totalBars": totalBars,
+		}).Debug("Received sync progress from NATS")
+		
+		handler(symbol, progress, totalBars)
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to sync updates: %w", err)
+	}
+	
+	nc.subsMu.Lock()
+	nc.subs[subject] = sub
+	nc.subsMu.Unlock()
+	
+	return nil
+}
+
+// SubscribeSyncComplete subscribes to sync completion notifications
+func (nc *NATSClient) SubscribeSyncComplete(handler func(string, int, time.Time, time.Time)) error {
+	subject := "sync.complete.*"
+	
+	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
+		var data map[string]interface{}
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
+			nc.logger.WithError(err).Error("Failed to unmarshal sync complete")
+			return
+		}
+		
+		symbol, _ := data["symbol"].(string)
+		totalBars := int(data["totalBars"].(float64))
+		startTime, _ := time.Parse(time.RFC3339, data["startTime"].(string))
+		endTime, _ := time.Parse(time.RFC3339, data["endTime"].(string))
+		
+		handler(symbol, totalBars, startTime, endTime)
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to sync complete: %w", err)
+	}
+	
+	nc.subsMu.Lock()
+	nc.subs[subject] = sub
+	nc.subsMu.Unlock()
+	
+	return nil
+}
+
+// PublishSyncError publishes sync error notification
+func (nc *NATSClient) PublishSyncError(symbol string, errorMsg string) error {
+	subject := fmt.Sprintf("sync.error.%s", symbol)
+	data, err := json.Marshal(map[string]interface{}{
+		"symbol":    symbol,
+		"error":     errorMsg,
+		"timestamp": time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal sync error: %w", err)
+	}
+	
+	_, err = nc.js.Publish(subject, data)
+	if err != nil {
+		return fmt.Errorf("failed to publish sync error: %w", err)
+	}
+	return nil
+}
+
+// SubscribeSyncErrors subscribes to sync error notifications
+func (nc *NATSClient) SubscribeSyncErrors(handler func(string, string)) error {
+	subject := "sync.error.*"
+	
+	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
+		var data map[string]interface{}
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
+			nc.logger.WithError(err).Error("Failed to unmarshal sync error")
+			return
+		}
+		
+		symbol, _ := data["symbol"].(string)
+		errorMsg, _ := data["error"].(string)
+		
+		handler(symbol, errorMsg)
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to sync errors: %w", err)
+	}
+	
+	nc.subsMu.Lock()
+	nc.subs[subject] = sub
+	nc.subsMu.Unlock()
+	
+	return nil
 }
