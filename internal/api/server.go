@@ -17,8 +17,10 @@ import (
 	apiHandlers "github.com/trade-back/internal/api/handlers"
 	"github.com/trade-back/internal/cache"
 	"github.com/trade-back/internal/database"
+	"github.com/trade-back/internal/exchange"
 	"github.com/trade-back/internal/indicator/enigma"
 	"github.com/trade-back/internal/messaging"
+	"github.com/trade-back/internal/services"
 	"github.com/trade-back/internal/websocket"
 	"github.com/trade-back/pkg/config"
 	"github.com/trade-back/pkg/models"
@@ -38,6 +40,9 @@ type Server struct {
 	natsClient    *messaging.NATSClient
 	enigmaCalc    *enigma.Calculator
 	wsManager     *websocket.BinaryManager
+	historicalLoader *services.OptimizedHistoricalLoader
+	instantEnigma    *services.InstantEnigmaService
+	hub           *exchange.Hub
 	
 	// API handlers
 	tradingViewAPI    *TradingViewAPI
@@ -55,6 +60,9 @@ func NewServer(
 	natsClient *messaging.NATSClient,
 	enigmaCalc *enigma.Calculator,
 	wsManager *websocket.BinaryManager,
+	historicalLoader *services.OptimizedHistoricalLoader,
+	instantEnigma *services.InstantEnigmaService,
+	hub *exchange.Hub,
 ) *Server {
 	s := &Server{
 		cfg:        cfg,
@@ -65,6 +73,9 @@ func NewServer(
 		natsClient: natsClient,
 		enigmaCalc: enigmaCalc,
 		wsManager:  wsManager,
+		historicalLoader: historicalLoader,
+		instantEnigma: instantEnigma,
+		hub: hub,
 	}
 	
 	if wsManager == nil {
@@ -74,7 +85,7 @@ func NewServer(
 	// Initialize API handlers
 	s.tradingViewAPI = NewTradingViewAPI(influxDB, mysqlDB, redisCache, enigmaCalc, logger)
 	s.webhookHandler = NewWebhookHandler(natsClient, &cfg.Webhook, logger)
-	s.historicalHandler = apiHandlers.NewHistoricalHandler(influxDB, mysqlDB, logger)
+	s.historicalHandler = apiHandlers.NewHistoricalHandler(influxDB, mysqlDB, natsClient, logger)
 	
 	// Setup routes
 	s.setupRoutes()
@@ -167,7 +178,7 @@ func (s *Server) Start() error {
 
 // Stop gracefully stops the HTTP server
 func (s *Server) Stop(ctx context.Context) error {
-	s.logger.Info("Stopping HTTP server")
+	// s.logger.Info("Stopping HTTP server")
 	return s.httpServer.Shutdown(ctx)
 }
 
@@ -182,14 +193,17 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 		
 		next.ServeHTTP(wrapped, r)
 		
-		s.logger.WithFields(logrus.Fields{
-			"method":     r.Method,
-			"path":       r.URL.Path,
-			"status":     wrapped.statusCode,
-			"duration":   time.Since(start),
-			"remote":     r.RemoteAddr,
-			"user_agent": r.UserAgent(),
-		}).Info("HTTP request")
+		// Only log errors (4xx and 5xx status codes)
+		if wrapped.statusCode >= 400 {
+			s.logger.WithFields(logrus.Fields{
+				"method":     r.Method,
+				"path":       r.URL.Path,
+				"status":     wrapped.statusCode,
+				"duration":   time.Since(start),
+				"remote":     r.RemoteAddr,
+				"user_agent": r.UserAgent(),
+			}).Error("HTTP request failed")
+		}
 	})
 }
 
@@ -253,8 +267,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetSymbols(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	
-	// Debug logging
-	s.logger.Debug("handleGetSymbols called - START")
 	
 	// Check if MySQL connection exists
 	if s.mysqlDB == nil {
@@ -263,7 +275,6 @@ func (s *Server) handleGetSymbols(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	s.logger.Debug("About to call mysqlDB.GetSymbols")
 	
 	// Get all symbols from database
 	symbols, err := s.mysqlDB.GetSymbols(ctx)
@@ -273,7 +284,7 @@ func (s *Server) handleGetSymbols(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	s.logger.WithField("count", len(symbols)).Info("Retrieved symbols from database")
+	// s.logger.WithField("count", len(symbols)).Info("Retrieved symbols from database")
 	
 	// Apply filters
 	exchange := r.URL.Query().Get("exchange")
@@ -446,7 +457,7 @@ func (s *Server) handleGetBars(w http.ResponseWriter, r *http.Request) {
 		"to":         to.Format(time.RFC3339),
 		"fromUnix":   from.Unix(),
 		"toUnix":     to.Unix(),
-	}).Debug("Getting bars")
+	})
 	
 	// Try cache first
 	ctx := context.Background()
@@ -488,7 +499,7 @@ func (s *Server) handleGetBars(w http.ResponseWriter, r *http.Request) {
 			"resolution": resolution,
 			"from":       from.Format(time.RFC3339),
 			"to":         to.Format(time.RFC3339),
-		}).Debug("Fetching bars from InfluxDB")
+		})
 		
 		bars, err := s.influxDB.GetBars(ctx, symbol, from, to, resolution)
 		if err != nil {
@@ -501,7 +512,7 @@ func (s *Server) handleGetBars(w http.ResponseWriter, r *http.Request) {
 			"symbol":     symbol,
 			"resolution": resolution,
 			"bar_count":  len(bars),
-		}).Debug("Retrieved bars from InfluxDB")
+		})
 		
 		// Cache the results for future requests
 		if len(bars) > 0 {
@@ -558,18 +569,72 @@ func (s *Server) handleGetEnigma(w http.ResponseWriter, r *http.Request) {
 
 // MarketWatchSymbol represents symbol data with price information
 type MarketWatchSymbol struct {
-	Symbol         string  `json:"symbol"`
-	Price          float64 `json:"price"`
-	Bid            float64 `json:"bid"`
-	BidSize        float64 `json:"bidSize"`
-	Ask            float64 `json:"ask"`
-	AskSize        float64 `json:"askSize"`
-	High           float64 `json:"high"`
-	Low            float64 `json:"low"`
-	Volume         float64 `json:"volume"`
-	Change         float64 `json:"change"`
-	ChangePercent  float64 `json:"changePercent"`
-	Timestamp      int64   `json:"timestamp"`
+	Symbol         string                `json:"symbol"`
+	Price          float64               `json:"price"`
+	Bid            float64               `json:"bid"`
+	BidSize        float64               `json:"bidSize"`
+	Ask            float64               `json:"ask"`
+	AskSize        float64               `json:"askSize"`
+	High           float64               `json:"high"`
+	Low            float64               `json:"low"`
+	Volume         float64               `json:"volume"`
+	Change         float64               `json:"change"`
+	ChangePercent  float64               `json:"changePercent"`
+	Timestamp      int64                 `json:"timestamp"`
+	SyncStatus     string                `json:"sync_status,omitempty"`
+	SyncProgress   int                   `json:"sync_progress,omitempty"`
+	TotalBars      int                   `json:"total_bars,omitempty"`
+	Enigma         *models.EnigmaData    `json:"enigma,omitempty"`
+}
+
+// syncRedisMarketWatch ensures Redis is in sync with MySQL for a session
+func (s *Server) syncRedisMarketWatch(ctx context.Context, token string) error {
+	// Get symbols from MySQL (source of truth)
+	mysqlSymbols, err := s.mysqlDB.GetMarketWatchSymbols(ctx, token)
+	if err != nil {
+		return fmt.Errorf("failed to get MySQL symbols: %w", err)
+	}
+	
+	// Get current Redis symbols
+	redisSymbols, err := s.redisCache.GetMarketWatch(ctx, token)
+	if err != nil && err.Error() != "redis: nil" {
+		s.logger.WithError(err).Warn("Failed to get Redis symbols, will rebuild")
+	}
+	
+	// Convert to maps for easy comparison
+	mysqlMap := make(map[string]bool)
+	for _, symbol := range mysqlSymbols {
+		mysqlMap[symbol] = true
+	}
+	
+	redisMap := make(map[string]bool)
+	for _, symbol := range redisSymbols {
+		redisMap[symbol] = true
+	}
+	
+	// Add missing symbols to Redis
+	for symbol := range mysqlMap {
+		if !redisMap[symbol] {
+			if err := s.redisCache.AddToMarketWatch(ctx, token, symbol); err != nil {
+				s.logger.WithError(err).WithField("symbol", symbol).Error("Failed to add missing symbol to Redis")
+			} else {
+				s.logger.WithField("symbol", symbol).Debug("Added missing symbol to Redis")
+			}
+		}
+	}
+	
+	// Remove extra symbols from Redis
+	for symbol := range redisMap {
+		if !mysqlMap[symbol] {
+			if err := s.redisCache.RemoveFromMarketWatch(ctx, token, symbol); err != nil {
+				s.logger.WithError(err).WithField("symbol", symbol).Error("Failed to remove extra symbol from Redis")
+			} else {
+				s.logger.WithField("symbol", symbol).Debug("Removed extra symbol from Redis")
+			}
+		}
+	}
+	
+	return nil
 }
 
 // handleGetMarketWatch retrieves user's watchlist with price data
@@ -580,21 +645,52 @@ func (s *Server) handleGetMarketWatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	symbols, err := s.redisCache.GetMarketWatch(context.Background(), token)
+	// Ensure Redis is in sync with MySQL
+	ctx := context.Background()
+	if err := s.syncRedisMarketWatch(ctx, token); err != nil {
+		s.logger.WithError(err).Warn("Failed to sync Redis with MySQL")
+	}
+	
+	// Get symbols with sync status from MySQL
+	symbolsWithStatus, err := s.mysqlDB.GetMarketWatchWithSyncStatus(context.Background(), token)
 	if err != nil {
+		s.logger.WithError(err).WithField("token", token).Error("Failed to get market watch from MySQL")
 		http.Error(w, "Failed to get market watch", http.StatusInternalServerError)
 		return
+	}
+	
+	// Extract just symbol names
+	symbols := make([]string, 0, len(symbolsWithStatus))
+	syncStatusMap := make(map[string]map[string]interface{})
+	for _, item := range symbolsWithStatus {
+		symbol := item["symbol"].(string)
+		symbols = append(symbols, symbol)
+		syncStatusMap[symbol] = item
 	}
 	
 	// Check if client wants detailed data
 	includeDetails := r.URL.Query().Get("detailed") == "true"
 	
+	// s.logger.WithFields(logrus.Fields{
+	// 	"includeDetails": includeDetails,
+	// 	"symbolCount": len(symbols),
+	// 	"token": token,
+	// }).Info("Processing market watch request")
+	
 	if !includeDetails || len(symbols) == 0 {
-		// Return simple response for backward compatibility
+		// Return simple response for backward compatibility with sync status
+		var simpleSymbols []interface{}
+		for _, item := range symbolsWithStatus {
+			simpleSymbols = append(simpleSymbols, map[string]interface{}{
+				"symbol": item["symbol"],
+				"sync_status": item["sync_status"],
+				"sync_progress": item["sync_progress"],
+			})
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"symbols": symbols,
-			"count":   len(symbols),
+			"symbols": simpleSymbols,
+			"count":   len(simpleSymbols),
 		})
 		return
 	}
@@ -602,18 +698,40 @@ func (s *Server) handleGetMarketWatch(w http.ResponseWriter, r *http.Request) {
 	// Fetch price data for all symbols
 	marketData := s.fetchMarketData(r.Context(), symbols)
 	
+	// Add sync status to market data
+	for i := range marketData {
+		if status, exists := syncStatusMap[marketData[i].Symbol]; exists {
+			// Add sync fields to market data (with safe type assertions)
+			if syncStatus, ok := status["sync_status"].(string); ok {
+				marketData[i].SyncStatus = syncStatus
+			}
+			if syncProgress, ok := status["sync_progress"].(int); ok {
+				marketData[i].SyncProgress = syncProgress
+			}
+			if totalBars, ok := status["total_bars"].(int); ok {
+				marketData[i].TotalBars = totalBars
+			}
+		}
+	}
+	
 	// Log the result for debugging
 	s.logger.WithFields(logrus.Fields{
 		"symbols_requested": symbols,
 		"market_data_count": len(marketData),
-	}).Debug("Market data fetched")
+	})
 	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	response := map[string]interface{}{
 		"symbols": marketData,
 		"count":   len(marketData),
 		"timestamp": time.Now().Unix(),
-	})
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		s.logger.WithError(err).Error("Failed to encode response")
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
 }
 
 // fetchMarketData fetches current market data for symbols
@@ -622,120 +740,55 @@ func (s *Server) fetchMarketData(ctx context.Context, symbols []string) []Market
 		return []MarketWatchSymbol{}
 	}
 	
-	// Try to get all tickers from cache first
-	cacheKey := "all_tickers"
-	var tickers map[string]*BinanceTicker24hr
+	// s.logger.WithField("symbols", symbols).Info("Fetching market data")
 	
-	cached, err := s.redisCache.Get(ctx, cacheKey)
-	if err == nil && cached != "" {
-		json.Unmarshal([]byte(cached), &tickers)
-	}
-	
-	// If not cached or expired, fetch from Binance
-	if tickers == nil {
-		tickers = s.fetchBinanceAllTickers(ctx)
-		// Cache for 5 seconds
-		if data, err := json.Marshal(tickers); err == nil {
-			s.redisCache.Set(ctx, cacheKey, string(data), 5*time.Second)
-		}
+	// Get live prices from Redis cache (populated by WebSocket subscriptions)
+	prices, err := s.redisCache.GetPrices(ctx, symbols)
+	if err != nil {
+		s.logger.WithError(err).Error("Failed to get prices from cache")
 	}
 	
 	// Build response
 	result := make([]MarketWatchSymbol, 0, len(symbols))
 	for _, symbol := range symbols {
-		if ticker, exists := tickers[symbol]; exists && ticker != nil {
-			result = append(result, MarketWatchSymbol{
-				Symbol:        symbol,
-				Price:         ticker.LastPrice,
-				Bid:           ticker.BidPrice,
-				BidSize:       ticker.BidQuantity,
-				Ask:           ticker.AskPrice,
-				AskSize:       ticker.AskQuantity,
-				High:          ticker.HighPrice,
-				Low:           ticker.LowPrice,
-				Volume:        ticker.Volume,
-				Change:        ticker.PriceChange,
-				ChangePercent: ticker.PriceChangePercent,
-				Timestamp:     time.Now().Unix(),
-			})
-		} else {
-			// Add placeholder data if ticker not found
-			s.logger.WithField("symbol", symbol).Warn("Ticker not found, using placeholder")
-			result = append(result, MarketWatchSymbol{
-				Symbol:        symbol,
-				Price:         0,
-				Bid:           0,
-				BidSize:       0,
-				Ask:           0,
-				AskSize:       0,
-				High:          0,
-				Low:           0,
-				Volume:        0,
-				Change:        0,
-				ChangePercent: 0,
-				Timestamp:     time.Now().Unix(),
-			})
+		marketSymbol := MarketWatchSymbol{
+			Symbol:    symbol,
+			Timestamp: time.Now().Unix(),
 		}
+		
+		// Use live price data from WebSocket subscriptions (stored in Redis)
+		if priceData, exists := prices[symbol]; exists && priceData != nil {
+			marketSymbol.Price = priceData.Price
+			marketSymbol.Bid = priceData.Bid
+			marketSymbol.Ask = priceData.Ask
+			marketSymbol.Volume = priceData.Volume
+			// Note: Additional fields like High, Low, Open are not available in PriceData
+			// These would need to be aggregated separately or fetched from historical data
+			
+			// Try to get Enigma data
+			if s.instantEnigma != nil && priceData.Price > 0 {
+				enigma, err := s.instantEnigma.GetInstantEnigma(ctx, symbol, priceData.Price)
+				if err != nil {
+					// s.logger.WithError(err).WithField("symbol", symbol).Debug("Failed to get Enigma data")
+				} else {
+					marketSymbol.Enigma = enigma
+				}
+			}
+		} else {
+			// Symbol not in cache means it's not being subscribed to via WebSocket
+			// This is expected behavior - only market watch symbols have live prices
+			// s.logger.WithField("symbol", symbol).Debug("No live price data (symbol not in active subscriptions)")
+		}
+		
+		result = append(result, marketSymbol)
 	}
 	
 	return result
 }
 
-// BinanceTicker24hr represents 24hr ticker from Binance
-type BinanceTicker24hr struct {
-	Symbol             string  `json:"symbol"`
-	PriceChange        float64 `json:"priceChange,string"`
-	PriceChangePercent float64 `json:"priceChangePercent,string"`
-	LastPrice          float64 `json:"lastPrice,string"`
-	BidPrice           float64 `json:"bidPrice,string"`
-	BidQuantity        float64 `json:"bidQty,string"`
-	AskPrice           float64 `json:"askPrice,string"`
-	AskQuantity        float64 `json:"askQty,string"`
-	OpenPrice          float64 `json:"openPrice,string"`
-	HighPrice          float64 `json:"highPrice,string"`
-	LowPrice           float64 `json:"lowPrice,string"`
-	Volume             float64 `json:"volume,string"`
-	Count              int64   `json:"count"`
-}
-
-// fetchBinanceAllTickers fetches all tickers from Binance
-func (s *Server) fetchBinanceAllTickers(ctx context.Context) map[string]*BinanceTicker24hr {
-	endpoint := "https://api.binance.com/api/v3/ticker/24hr"
-	
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
-	if err != nil {
-		s.logger.WithError(err).Error("Failed to create request")
-		return map[string]*BinanceTicker24hr{}
-	}
-	
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		s.logger.WithError(err).Error("Failed to fetch tickers")
-		return map[string]*BinanceTicker24hr{}
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		s.logger.Errorf("Binance API error: status=%d", resp.StatusCode)
-		return map[string]*BinanceTicker24hr{}
-	}
-	
-	var tickers []BinanceTicker24hr
-	if err := json.NewDecoder(resp.Body).Decode(&tickers); err != nil {
-		s.logger.WithError(err).Error("Failed to decode response")
-		return map[string]*BinanceTicker24hr{}
-	}
-	
-	s.logger.WithField("ticker_count", len(tickers)).Debug("Fetched tickers from Binance")
-	
-	// Convert to map for easy lookup
-	tickerMap := make(map[string]*BinanceTicker24hr)
-	for i := range tickers {
-		tickerMap[tickers[i].Symbol] = &tickers[i]
-	}
-	
-	return tickerMap
-}
+// Removed fetchBinanceAllTickers and BinanceTicker24hr - now using live WebSocket data from Redis cache
+// This ensures we only fetch data for symbols in users' market watch lists, improving performance
+// and reducing unnecessary API calls to Binance
 
 // handleAddToMarketWatch adds symbol to watchlist
 func (s *Server) handleAddToMarketWatch(w http.ResponseWriter, r *http.Request) {
@@ -766,13 +819,126 @@ func (s *Server) handleAddToMarketWatch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	
-	if err := s.redisCache.AddToMarketWatch(context.Background(), token, req.Symbol); err != nil {
+	ctx := context.Background()
+	
+	// Add to MySQL first (source of truth)
+	if err := s.mysqlDB.AddToMarketWatch(ctx, token, req.Symbol); err != nil {
+		s.logger.WithError(err).WithField("symbol", req.Symbol).Error("Failed to add symbol to MySQL")
 		http.Error(w, "Failed to add symbol", http.StatusInternalServerError)
 		return
 	}
 	
+	// Then add to Redis cache (critical for real-time updates)
+	if err := s.redisCache.AddToMarketWatch(ctx, token, req.Symbol); err != nil {
+		s.logger.WithError(err).WithFields(logrus.Fields{
+			"symbol": req.Symbol,
+			"token": token,
+		}).Error("Failed to add symbol to Redis - data inconsistency warning!")
+		
+		// Try to recover by re-adding
+		go func() {
+			time.Sleep(1 * time.Second)
+			if err := s.redisCache.AddToMarketWatch(context.Background(), token, req.Symbol); err != nil {
+				s.logger.WithError(err).Error("Failed to recover Redis sync")
+			} else {
+				s.logger.Info("Successfully recovered Redis sync")
+			}
+		}()
+	}
+	
 	// Notify all WebSocket clients with the same session token to auto-subscribe
 	s.wsManager.AutoSubscribeSymbol(token, req.Symbol)
+	
+	// Add symbol to the hub for live price streaming
+	if s.hub != nil {
+		if err := s.hub.AddSymbol(req.Symbol); err != nil {
+			s.logger.WithError(err).WithField("symbol", req.Symbol).Error("Failed to add symbol to hub")
+		}
+	}
+	
+	// Get instant Enigma and send via WebSocket
+	if s.instantEnigma != nil {
+		go func() {
+			ctx := context.Background()
+			
+			// Get current price
+			price, err := s.redisCache.GetPrice(ctx, req.Symbol)
+			if err != nil || price == nil {
+				// s.logger.WithError(err).WithField("symbol", req.Symbol).Warn("Failed to get current price for Enigma")
+				return
+			}
+			
+			// Calculate instant Enigma
+			_, err = s.instantEnigma.GetInstantEnigma(ctx, req.Symbol, price.Price)
+			if err != nil {
+				// s.logger.WithError(err).WithField("symbol", req.Symbol).Warn("Failed to calculate instant Enigma")
+			} else {
+				// Enigma is automatically sent via NATS/WebSocket by the service
+				// s.logger.WithField("symbol", req.Symbol).Info("Instant Enigma calculated and sent")
+			}
+		}()
+	}
+	
+	// Start background historical sync
+	if s.historicalLoader != nil {
+		go func() {
+			ctx := context.Background()
+			
+			// Update sync status to pending
+			if err := s.mysqlDB.UpdateSyncStatus(ctx, req.Symbol, "pending", 0, 0, ""); err != nil {
+				s.logger.WithError(err).Error("Failed to update sync status")
+			}
+			
+			// Start sync with 1000 days of 1m data
+			// s.logger.WithField("symbol", req.Symbol).Info("Starting background historical sync")
+			
+			// Retry mechanism for failed syncs
+			maxRetries := 3
+			retryDelay := 5 * time.Second
+			
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				if err := s.mysqlDB.UpdateSyncStatus(ctx, req.Symbol, "syncing", 0, 0, ""); err != nil {
+					s.logger.WithError(err).Error("Failed to update sync status to syncing")
+				}
+				
+				// Pass session token in context for progress updates
+				ctxWithSession := context.WithValue(ctx, "session_token", token)
+				err := s.historicalLoader.LoadHistoricalDataIncremental(ctxWithSession, req.Symbol, "1m", 1000)
+				if err == nil {
+					// Success - mark as completed
+					if err := s.mysqlDB.UpdateSyncStatus(ctx, req.Symbol, "completed", 100, 1000*1440, ""); err != nil {
+						s.logger.WithError(err).Error("Failed to update sync completion")
+					}
+					// s.logger.WithField("symbol", req.Symbol).Info("Historical sync completed")
+					return
+				}
+				
+				// Error occurred
+				s.logger.WithError(err).WithFields(logrus.Fields{
+					"symbol":  req.Symbol,
+					"attempt": attempt,
+					"max":     maxRetries,
+				}).Error("Failed to sync historical data")
+				
+				if attempt < maxRetries {
+					// Not the last attempt, wait and retry
+					s.logger.WithFields(logrus.Fields{
+						"symbol": req.Symbol,
+						"delay":  retryDelay,
+						"attempt": attempt + 1,
+					}).Info("Retrying historical sync")
+					time.Sleep(retryDelay)
+					retryDelay *= 2 // Exponential backoff
+				} else {
+					// Final attempt failed
+					s.mysqlDB.UpdateSyncStatus(ctx, req.Symbol, "failed", 0, 0, "Sync failed after multiple attempts")
+					if s.natsClient != nil {
+						s.natsClient.PublishSyncError(req.Symbol, fmt.Sprintf("Sync failed after %d attempts: %v", maxRetries, err))
+					}
+				}
+			}
+		}()
+	}
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -792,9 +958,31 @@ func (s *Server) handleRemoveFromMarketWatch(w http.ResponseWriter, r *http.Requ
 	vars := mux.Vars(r)
 	symbol := vars["symbol"]
 	
-	if err := s.redisCache.RemoveFromMarketWatch(context.Background(), token, symbol); err != nil {
+	ctx := context.Background()
+	
+	// Remove from MySQL first (source of truth)
+	if err := s.mysqlDB.RemoveFromMarketWatch(ctx, token, symbol); err != nil {
+		s.logger.WithError(err).WithField("symbol", symbol).Error("Failed to remove symbol from MySQL")
 		http.Error(w, "Failed to remove symbol", http.StatusInternalServerError)
 		return
+	}
+	
+	// Then remove from Redis cache (critical for real-time updates)
+	if err := s.redisCache.RemoveFromMarketWatch(ctx, token, symbol); err != nil {
+		s.logger.WithError(err).WithFields(logrus.Fields{
+			"symbol": symbol,
+			"token": token,
+		}).Error("Failed to remove symbol from Redis - data inconsistency warning!")
+		
+		// Try to recover by re-removing
+		go func() {
+			time.Sleep(1 * time.Second)
+			if err := s.redisCache.RemoveFromMarketWatch(context.Background(), token, symbol); err != nil {
+				s.logger.WithError(err).Error("Failed to recover Redis sync")
+			} else {
+				s.logger.Info("Successfully recovered Redis sync")
+			}
+		}()
 	}
 	
 	// Notify all WebSocket clients with the same session token to auto-unsubscribe
@@ -802,16 +990,32 @@ func (s *Server) handleRemoveFromMarketWatch(w http.ResponseWriter, r *http.Requ
 		"token": token,
 		"symbol": symbol,
 		"wsManager": s.wsManager != nil,
-	}).Info("Calling AutoUnsubscribeSymbol")
+	}).Debug("Calling AutoUnsubscribeSymbol")
 	
 	if s.wsManager != nil {
 		s.wsManager.AutoUnsubscribeSymbol(token, symbol)
 		s.logger.WithFields(logrus.Fields{
 			"token": token,
 			"symbol": symbol,
-		}).Info("Called AutoUnsubscribeSymbol successfully")
+		}).Debug("Called AutoUnsubscribeSymbol successfully")
 	} else {
 		s.logger.Error("WebSocket manager is nil, cannot send auto-unsubscribe")
+	}
+	
+	// Remove symbol from hub if no other users are watching it
+	if s.hub != nil {
+		// Check if any other users have this symbol
+		// For now, we'll keep the symbol in hub as other users might need it
+		// TODO: Implement reference counting for symbols
+	}
+	
+	// Send symbol removal notification
+	if s.wsManager != nil {
+		s.wsManager.SendSymbolRemoved(token, symbol)
+		s.logger.WithFields(logrus.Fields{
+			"token": token,
+			"symbol": symbol,
+		}).Debug("Sent symbol removal notification")
 	}
 	
 	w.Header().Set("Content-Type", "application/json")

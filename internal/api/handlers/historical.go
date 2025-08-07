@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -10,13 +11,16 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 	"github.com/trade-back/internal/database"
+	"github.com/trade-back/internal/messaging"
 	"github.com/trade-back/internal/services"
 )
 
 // HistoricalHandler handles historical data API requests
 type HistoricalHandler struct {
 	loader *services.HistoricalLoader
+	influx *database.InfluxClient
 	mysql  *database.MySQLClient
+	nats   *messaging.NATSClient
 	logger *logrus.Entry
 }
 
@@ -24,11 +28,14 @@ type HistoricalHandler struct {
 func NewHistoricalHandler(
 	influx *database.InfluxClient,
 	mysql *database.MySQLClient,
+	nats *messaging.NATSClient,
 	logger *logrus.Logger,
 ) *HistoricalHandler {
 	return &HistoricalHandler{
 		loader: services.NewHistoricalLoader(influx, mysql, logger),
+		influx: influx,
 		mysql:  mysql,
+		nats:   nats,
 		logger: logger.WithField("component", "historical-api"),
 	}
 }
@@ -92,13 +99,12 @@ func (h *HistoricalHandler) BackfillSymbol(w http.ResponseWriter, r *http.Reques
 			"interval": req.Interval,
 			"days":     req.Days,
 			"task_id":  taskID,
-		}).Info("Starting symbol backfill via API")
+		})
 
 		if err := h.loader.LoadHistoricalData(ctx, req.Symbol, req.Interval, req.Days); err != nil {
 			h.logger.WithError(err).WithField("task_id", taskID).Error("Symbol backfill failed")
 			// In production, you would update task status in database
 		} else {
-			h.logger.WithField("task_id", taskID).Info("Symbol backfill completed")
 		}
 	}()
 
@@ -161,12 +167,11 @@ func (h *HistoricalHandler) BackfillAll(w http.ResponseWriter, r *http.Request) 
 			"interval": req.Interval,
 			"days":     req.Days,
 			"task_id":  taskID,
-		}).Info("Starting all symbols backfill via API")
+		})
 
 		if err := h.loader.LoadAllSymbols(ctx, req.Interval, req.Days); err != nil {
 			h.logger.WithError(err).WithField("task_id", taskID).Error("All symbols backfill failed")
 		} else {
-			h.logger.WithField("task_id", taskID).Info("All symbols backfill completed")
 		}
 	}()
 
@@ -181,6 +186,77 @@ func (h *HistoricalHandler) BackfillAll(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// BackfillSymbolUltraFast handles POST /api/v1/historical/backfill/ultra-fast/symbol
+func (h *HistoricalHandler) BackfillSymbolUltraFast(w http.ResponseWriter, r *http.Request) {
+	var req BackfillSymbolRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	
+	// Validate required fields
+	if req.Symbol == "" || req.Interval == "" || req.Days < 1 || req.Days > 1500 {
+		h.writeError(w, http.StatusBadRequest, "Missing or invalid parameters")
+		return
+	}
+
+	// Validate interval
+	if !h.isValidInterval(req.Interval) {
+		h.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error": "invalid interval",
+			"valid_intervals": []string{"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"},
+		})
+		return
+	}
+
+	taskID := fmt.Sprintf("ultrafast-%s-%s-%d-%d", req.Symbol, req.Interval, req.Days, time.Now().Unix())
+	startTime := time.Now()
+
+	// Create ultra-fast loader
+	ultraLoader := services.NewUltraFastHistoricalLoader(
+		h.influx,
+		h.mysql, 
+		h.nats,
+		h.logger.Logger,
+	)
+
+	// Start backfill in background
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+
+		h.logger.WithFields(logrus.Fields{
+			"symbol":   req.Symbol,
+			"interval": req.Interval,
+			"days":     req.Days,
+			"taskID":   taskID,
+		}).Info("Starting ultra-fast backfill")
+
+		if err := ultraLoader.LoadHistoricalDataUltraFast(ctx, req.Symbol, req.Interval, req.Days); err != nil {
+			h.logger.WithError(err).WithFields(logrus.Fields{
+				"symbol": req.Symbol,
+				"taskID": taskID,
+			}).Error("Ultra-fast backfill failed")
+		} else {
+			h.logger.WithFields(logrus.Fields{
+				"symbol":   req.Symbol,
+				"taskID":   taskID,
+				"duration": time.Since(startTime),
+			}).Info("Ultra-fast backfill completed successfully")
+		}
+	}()
+
+	h.writeJSON(w, http.StatusAccepted, BackfillResponse{
+		Status:    "accepted",
+		Message:   "Ultra-fast backfill started (up to 10x faster)",
+		Symbol:    req.Symbol,
+		Interval:  req.Interval,
+		Days:      req.Days,
+		StartTime: startTime,
+		TaskID:    taskID,
+	})
+}
+
 // CalculateATHATL handles POST /api/v1/historical/ath-atl
 func (h *HistoricalHandler) CalculateATHATL(w http.ResponseWriter, r *http.Request) {
 	taskID := h.generateTaskID()
@@ -188,12 +264,10 @@ func (h *HistoricalHandler) CalculateATHATL(w http.ResponseWriter, r *http.Reque
 
 	go func() {
 		ctx := context.Background()
-		h.logger.WithField("task_id", taskID).Info("Starting ATH/ATL calculation via API")
 
 		if err := h.loader.LoadATHATL(ctx); err != nil {
 			h.logger.WithError(err).WithField("task_id", taskID).Error("ATH/ATL calculation failed")
 		} else {
-			h.logger.WithField("task_id", taskID).Info("ATH/ATL calculation completed")
 		}
 	}()
 
@@ -228,10 +302,11 @@ func (h *HistoricalHandler) GetHistoricalDataInfo(w http.ResponseWriter, r *http
 		h.writeJSON(w, http.StatusOK, map[string]interface{}{
 			"message": "Historical data API",
 			"endpoints": map[string]string{
-				"backfill_symbol": "POST /api/v1/historical/backfill/symbol",
-				"backfill_all":    "POST /api/v1/historical/backfill/all",
-				"calculate_ath":   "POST /api/v1/historical/ath-atl",
-				"status":          "GET /api/v1/historical/status/:taskId",
+				"backfill_symbol":      "POST /api/v1/historical/backfill/symbol",
+				"backfill_all":         "POST /api/v1/historical/backfill/all",
+				"backfill_ultra_fast":  "POST /api/v1/historical/backfill/ultra-fast/symbol",
+				"calculate_ath":        "POST /api/v1/historical/ath-atl",
+				"status":               "GET /api/v1/historical/status/:taskId",
 			},
 			"supported_intervals": []string{"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"},
 			"max_days": 1500,
@@ -280,6 +355,7 @@ func (h *HistoricalHandler) RegisterRoutes(router *mux.Router) {
 	historical := router.PathPrefix("/api/v1/historical").Subrouter()
 	historical.HandleFunc("/backfill/symbol", h.BackfillSymbol).Methods("POST")
 	historical.HandleFunc("/backfill/all", h.BackfillAll).Methods("POST")
+	historical.HandleFunc("/backfill/ultra-fast/symbol", h.BackfillSymbolUltraFast).Methods("POST")
 	historical.HandleFunc("/ath-atl", h.CalculateATHATL).Methods("POST")
 	historical.HandleFunc("/status/{taskId}", h.GetBackfillStatus).Methods("GET")
 	historical.HandleFunc("/info", h.GetHistoricalDataInfo).Methods("GET")
