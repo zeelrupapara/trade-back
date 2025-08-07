@@ -15,6 +15,10 @@ const (
 	MsgTypeSessionChange = 0x0003
 	MsgTypeMarketWatch   = 0x0004
 	MsgTypeHeartbeat     = 0x0005
+	MsgTypeSyncProgress  = 0x0006 // Sync progress updates
+	MsgTypeSyncComplete  = 0x0007 // Sync completion notification
+	MsgTypeSyncError     = 0x0008 // Sync error notification
+	MsgTypeSymbolRemoved = 0x0009 // Symbol removed notification
 	MsgTypeError         = 0x00FF
 )
 
@@ -41,8 +45,9 @@ func EncodePriceData(price *PriceData) ([]byte, error) {
 	symbolBytes := []byte(price.Symbol)
 	symbolLen := len(symbolBytes)
 	
-	// Calculate total message size: header(8) + symbol + pricedata(32) + checksum(4)
-	totalSize := 8 + symbolLen + 32 + 4
+	// Calculate total message size: header(8) + symbol + pricedata(72) + checksum(4)
+	// Price data now includes: price(8) + bid(8) + ask(8) + volume(8) + change24h(8) + changePercent(8) + open24h(8) + high24h(8) + low24h(8)
+	totalSize := 8 + symbolLen + 72 + 4
 	buf := make([]byte, totalSize)
 	
 	// Write header
@@ -53,12 +58,17 @@ func EncodePriceData(price *PriceData) ([]byte, error) {
 	// Write symbol
 	copy(buf[8:8+symbolLen], symbolBytes)
 	
-	// Write price data (32 bytes total)
+	// Write price data (72 bytes total)
 	offset := 8 + symbolLen
 	binary.LittleEndian.PutUint64(buf[offset:offset+8], math.Float64bits(price.Price))
 	binary.LittleEndian.PutUint64(buf[offset+8:offset+16], math.Float64bits(price.Bid))
 	binary.LittleEndian.PutUint64(buf[offset+16:offset+24], math.Float64bits(price.Ask))
 	binary.LittleEndian.PutUint64(buf[offset+24:offset+32], math.Float64bits(price.Volume))
+	binary.LittleEndian.PutUint64(buf[offset+32:offset+40], math.Float64bits(price.Change24h))
+	binary.LittleEndian.PutUint64(buf[offset+40:offset+48], math.Float64bits(price.ChangePercent))
+	binary.LittleEndian.PutUint64(buf[offset+48:offset+56], math.Float64bits(price.Open24h))
+	binary.LittleEndian.PutUint64(buf[offset+56:offset+64], math.Float64bits(price.High24h))
+	binary.LittleEndian.PutUint64(buf[offset+64:offset+72], math.Float64bits(price.Low24h))
 	
 	// Calculate and write checksum (exclude the checksum bytes themselves)
 	payloadSize := totalSize - 4
@@ -70,7 +80,7 @@ func EncodePriceData(price *PriceData) ([]byte, error) {
 
 // DecodePriceData converts binary data back to PriceData
 func DecodePriceData(data []byte) (*PriceData, error) {
-	if len(data) < 44 { // Minimum size: 8 + 1 + 32 + 4
+	if len(data) < 84 { // Minimum size: 8 + 1 + 72 + 4
 		return nil, fmt.Errorf("insufficient data length: %d", len(data))
 	}
 	
@@ -84,7 +94,7 @@ func DecodePriceData(data []byte) (*PriceData, error) {
 	timestamp := binary.LittleEndian.Uint32(data[4:8])
 	
 	// Validate total length
-	expectedLen := 8 + int(symbolLen) + 32 + 4
+	expectedLen := 8 + int(symbolLen) + 72 + 4
 	if len(data) != expectedLen {
 		return nil, fmt.Errorf("invalid data length: expected %d, got %d", expectedLen, len(data))
 	}
@@ -100,20 +110,30 @@ func DecodePriceData(data []byte) (*PriceData, error) {
 	// Read symbol
 	symbol := string(data[8 : 8+symbolLen])
 	
-	// Read price data
+	// Read price data (72 bytes)
 	offset := 8 + int(symbolLen)
 	price := math.Float64frombits(binary.LittleEndian.Uint64(data[offset : offset+8]))
 	bid := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+8 : offset+16]))
 	ask := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+16 : offset+24]))
 	volume := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+24 : offset+32]))
+	change24h := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+32 : offset+40]))
+	changePercent := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+40 : offset+48]))
+	open24h := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+48 : offset+56]))
+	high24h := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+56 : offset+64]))
+	low24h := math.Float64frombits(binary.LittleEndian.Uint64(data[offset+64 : offset+72]))
 	
 	return &PriceData{
-		Symbol:    symbol,
-		Price:     price,
-		Bid:       bid,
-		Ask:       ask,
-		Volume:    volume,
-		Timestamp: time.Unix(int64(timestamp), 0),
+		Symbol:        symbol,
+		Price:         price,
+		Bid:           bid,
+		Ask:           ask,
+		Volume:        volume,
+		Change24h:     change24h,
+		ChangePercent: changePercent,
+		Open24h:       open24h,
+		High24h:       high24h,
+		Low24h:        low24h,
+		Timestamp:     time.Unix(int64(timestamp), 0),
 	}, nil
 }
 
@@ -191,7 +211,7 @@ func BatchEncodePrices(prices []*PriceData) ([]byte, error) {
 	// Calculate total size needed
 	totalSize := 8 // Header
 	for _, price := range prices {
-		totalSize += 2 + len(price.Symbol) + 32 // SymbolLen(2) + Symbol + PriceData(32)
+		totalSize += 2 + len(price.Symbol) + 72 // SymbolLen(2) + Symbol + PriceData(72)
 	}
 	totalSize += 4 // Checksum
 	
@@ -212,12 +232,17 @@ func BatchEncodePrices(prices []*PriceData) ([]byte, error) {
 		copy(buf[offset+2:offset+2+symbolLen], symbolBytes)
 		offset += 2 + symbolLen
 		
-		// Write price data
+		// Write price data (72 bytes)
 		binary.LittleEndian.PutUint64(buf[offset:offset+8], math.Float64bits(price.Price))
 		binary.LittleEndian.PutUint64(buf[offset+8:offset+16], math.Float64bits(price.Bid))
 		binary.LittleEndian.PutUint64(buf[offset+16:offset+24], math.Float64bits(price.Ask))
 		binary.LittleEndian.PutUint64(buf[offset+24:offset+32], math.Float64bits(price.Volume))
-		offset += 32
+		binary.LittleEndian.PutUint64(buf[offset+32:offset+40], math.Float64bits(price.Change24h))
+		binary.LittleEndian.PutUint64(buf[offset+40:offset+48], math.Float64bits(price.ChangePercent))
+		binary.LittleEndian.PutUint64(buf[offset+48:offset+56], math.Float64bits(price.Open24h))
+		binary.LittleEndian.PutUint64(buf[offset+56:offset+64], math.Float64bits(price.High24h))
+		binary.LittleEndian.PutUint64(buf[offset+64:offset+72], math.Float64bits(price.Low24h))
+		offset += 72
 	}
 	
 	// Calculate and write checksum
@@ -251,4 +276,122 @@ func ValidateChecksum(data []byte) error {
 	}
 	
 	return nil
+}
+
+// EncodeSyncProgress creates a binary sync progress message
+func EncodeSyncProgress(symbol string, progress int, totalBars int) ([]byte, error) {
+	symbolBytes := []byte(symbol)
+	symbolLen := len(symbolBytes)
+	
+	// Header(8) + Symbol + Progress(4) + TotalBars(4) + Checksum(4)
+	totalSize := 8 + symbolLen + 8 + 4
+	buf := make([]byte, totalSize)
+	
+	// Write header
+	binary.LittleEndian.PutUint16(buf[0:2], MsgTypeSyncProgress)
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(symbolLen))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(time.Now().Unix()))
+	
+	// Write symbol
+	copy(buf[8:8+symbolLen], symbolBytes)
+	
+	// Write progress data
+	offset := 8 + symbolLen
+	binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(progress))
+	binary.LittleEndian.PutUint32(buf[offset+4:offset+8], uint32(totalBars))
+	
+	// Calculate and write checksum
+	payloadSize := totalSize - 4
+	checksum := crc32.ChecksumIEEE(buf[:payloadSize])
+	binary.LittleEndian.PutUint32(buf[payloadSize:], checksum)
+	
+	return buf, nil
+}
+
+// EncodeSyncComplete creates a binary sync complete message
+func EncodeSyncComplete(symbol string, totalBars int, startTime, endTime time.Time) ([]byte, error) {
+	symbolBytes := []byte(symbol)
+	symbolLen := len(symbolBytes)
+	
+	// Header(8) + Symbol + TotalBars(4) + StartTime(8) + EndTime(8) + Checksum(4)
+	totalSize := 8 + symbolLen + 20 + 4
+	buf := make([]byte, totalSize)
+	
+	// Write header
+	binary.LittleEndian.PutUint16(buf[0:2], MsgTypeSyncComplete)
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(symbolLen))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(time.Now().Unix()))
+	
+	// Write symbol
+	copy(buf[8:8+symbolLen], symbolBytes)
+	
+	// Write completion data
+	offset := 8 + symbolLen
+	binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(totalBars))
+	binary.LittleEndian.PutUint64(buf[offset+4:offset+12], uint64(startTime.Unix()))
+	binary.LittleEndian.PutUint64(buf[offset+12:offset+20], uint64(endTime.Unix()))
+	
+	// Calculate and write checksum
+	payloadSize := totalSize - 4
+	checksum := crc32.ChecksumIEEE(buf[:payloadSize])
+	binary.LittleEndian.PutUint32(buf[payloadSize:], checksum)
+	
+	return buf, nil
+}
+
+// EncodeSymbolRemoved creates a binary symbol removed notification
+func EncodeSymbolRemoved(symbol string) ([]byte, error) {
+	symbolBytes := []byte(symbol)
+	symbolLen := len(symbolBytes)
+	
+	// Header(8) + Symbol + Checksum(4)
+	totalSize := 8 + symbolLen + 4
+	buf := make([]byte, totalSize)
+	
+	// Write header
+	binary.LittleEndian.PutUint16(buf[0:2], MsgTypeSymbolRemoved)
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(symbolLen))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(time.Now().Unix()))
+	
+	// Write symbol
+	copy(buf[8:8+symbolLen], symbolBytes)
+	
+	// Calculate and write checksum
+	payloadSize := totalSize - 4
+	checksum := crc32.ChecksumIEEE(buf[:payloadSize])
+	binary.LittleEndian.PutUint32(buf[payloadSize:], checksum)
+	
+	return buf, nil
+}
+
+// EncodeSyncError creates a binary sync error message
+func EncodeSyncError(symbol string, errorMsg string) ([]byte, error) {
+	symbolBytes := []byte(symbol)
+	symbolLen := len(symbolBytes)
+	errorBytes := []byte(errorMsg)
+	errorLen := len(errorBytes)
+	
+	// Header(8) + Symbol + ErrorLen(2) + ErrorMsg + Checksum(4)
+	totalSize := 8 + symbolLen + 2 + errorLen + 4
+	buf := make([]byte, totalSize)
+	
+	// Write header
+	binary.LittleEndian.PutUint16(buf[0:2], MsgTypeSyncError)
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(symbolLen))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(time.Now().Unix()))
+	
+	// Write symbol
+	copy(buf[8:8+symbolLen], symbolBytes)
+	
+	// Write error message
+	offset := 8 + symbolLen
+	binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(errorLen))
+	copy(buf[offset+2:offset+2+errorLen], errorBytes)
+	
+	// Calculate and write checksum
+	payloadSize := totalSize - 4
+	checksum := crc32.ChecksumIEEE(buf[:payloadSize])
+	binary.LittleEndian.PutUint32(buf[payloadSize:], checksum)
+	
+	return buf, nil
 }

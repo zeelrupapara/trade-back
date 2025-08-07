@@ -67,7 +67,7 @@ func (bc *BinanceClient) Connect(ctx context.Context) error {
 		return bc.ConnectHighFreq(ctx)
 	}
 	
-	bc.logger.Info("Connecting to Binance WebSocket using official library...")
+	// bc.logger.Info("Connecting to Binance WebSocket using official library...")
 	
 	// Create WebSocket client with combined=true for multiple symbols
 	bc.client = binance.NewWebsocketStreamClient(true) // true = combined stream for multiple symbols
@@ -86,7 +86,7 @@ func (bc *BinanceClient) Connect(ctx context.Context) error {
 	bc.connected.Store(true)
 	bc.lastPing = time.Now()
 	
-	bc.logger.WithField("symbols", len(bc.symbols)).Info("Connected to Binance WebSocket successfully")
+	// bc.logger.WithField("symbols", len(bc.symbols)).Info("Connected to Binance WebSocket successfully")
 	
 	// Start monitoring goroutine
 	go bc.monitorConnection(ctx, doneCh)
@@ -96,7 +96,7 @@ func (bc *BinanceClient) Connect(ctx context.Context) error {
 
 // ConnectHighFreq establishes high-frequency connections
 func (bc *BinanceClient) ConnectHighFreq(ctx context.Context) error {
-	bc.logger.Info("Connecting to Binance high-frequency streams...")
+	// bc.logger.Info("Connecting to Binance high-frequency streams...")
 	
 	// Create WebSocket client with combined=true for multiple symbols
 	bc.client = binance.NewWebsocketStreamClient(true)
@@ -137,7 +137,7 @@ func (bc *BinanceClient) ConnectHighFreq(ctx context.Context) error {
 		// All streams started successfully
 		bc.connected.Store(true)
 		bc.lastPing = time.Now()
-		bc.logger.Info("Connected to Binance high-frequency streams successfully")
+		// bc.logger.Info("Connected to Binance high-frequency streams successfully")
 		
 		// Start metrics reporter
 		go bc.reportMetrics(ctx)
@@ -200,15 +200,64 @@ func (bc *BinanceClient) convertEventToPriceData(event *binance.WsMarketTickerSt
 		volume = 0
 	}
 	
-	return &models.PriceData{
-		Symbol:    event.Symbol,
-		Price:     price,
-		Bid:       bid,
-		Ask:       ask,
-		Volume:    volume,
-		Timestamp: time.Unix(event.Time/1000, (event.Time%1000)*1e6),
-		Sequence:  uint64(event.LastID), // Use LastID as sequence for gap detection
+	// Parse 24hr change data
+	change24h, err := strconv.ParseFloat(event.PriceChange, 64)
+	if err != nil {
+		bc.logger.WithError(err).WithField("change", event.PriceChange).Error("Failed to parse 24h change")
+		change24h = 0
 	}
+	
+	changePercent, err := strconv.ParseFloat(event.PriceChangePercent, 64)
+	if err != nil {
+		bc.logger.WithError(err).WithField("changePercent", event.PriceChangePercent).Error("Failed to parse change percent")
+		changePercent = 0
+	}
+	
+	open24h, err := strconv.ParseFloat(event.OpenPrice, 64)
+	if err != nil {
+		bc.logger.WithError(err).WithField("open", event.OpenPrice).Error("Failed to parse open price")
+		open24h = 0
+	}
+	
+	high24h, err := strconv.ParseFloat(event.HighPrice, 64)
+	if err != nil {
+		bc.logger.WithError(err).WithField("high", event.HighPrice).Error("Failed to parse high price")
+		high24h = 0
+	}
+	
+	low24h, err := strconv.ParseFloat(event.LowPrice, 64)
+	if err != nil {
+		bc.logger.WithError(err).WithField("low", event.LowPrice).Error("Failed to parse low price")
+		low24h = 0
+	}
+	
+	priceData := &models.PriceData{
+		Symbol:        event.Symbol,
+		Price:         price,
+		Bid:           bid,
+		Ask:           ask,
+		Volume:        volume,
+		Change24h:     change24h,
+		ChangePercent: changePercent,
+		Open24h:       open24h,
+		High24h:       high24h,
+		Low24h:        low24h,
+		Timestamp:     time.Unix(event.Time/1000, (event.Time%1000)*1e6),
+		Sequence:      uint64(event.LastID), // Use LastID as sequence for gap detection
+	}
+	
+	// DEBUG: Log 24hr change data
+	if changePercent != 0 {
+		bc.logger.WithFields(map[string]interface{}{
+			"symbol": event.Symbol,
+			"changePercent": changePercent,
+			"change24h": change24h,
+			"price": price,
+			"open24h": open24h,
+		}).Info("24hr change data from Binance")
+	}
+	
+	return priceData
 }
 
 // RegisterHandler registers a message handler
@@ -232,7 +281,6 @@ func (bc *BinanceClient) GetSymbols() []string {
 func (bc *BinanceClient) monitorConnection(ctx context.Context, doneCh chan struct{}) {
 	defer func() {
 		bc.connected.Store(false)
-		bc.logger.Info("Connection monitor stopped")
 	}()
 	
 	for {
@@ -402,9 +450,7 @@ func (bc *BinanceClient) handlePriceUpdate(price *models.PriceData) {
 func (bc *BinanceClient) monitorStream(ctx context.Context, doneCh chan struct{}, streamType string) {
 	select {
 	case <-ctx.Done():
-		bc.logger.WithField("stream", streamType).Info("Stream monitor stopped by context")
 	case <-bc.done:
-		bc.logger.WithField("stream", streamType).Info("Stream monitor stopped by client")
 	case <-doneCh:
 		bc.logger.WithField("stream", streamType).Warn("Stream closed by server")
 		// TODO: Implement reconnection logic
@@ -423,16 +469,6 @@ func (bc *BinanceClient) reportMetrics(ctx context.Context) {
 		case <-bc.done:
 			return
 		case <-ticker.C:
-			count := bc.messageCount.Load()
-			elapsed := time.Since(bc.lastReset).Seconds()
-			rate := float64(count) / elapsed
-			
-			bc.logger.WithFields(logrus.Fields{
-				"messages_total": count,
-				"messages_per_second": rate,
-				"elapsed_seconds": elapsed,
-			}).Info("High-frequency stream metrics")
-			
 			// Reset counters
 			bc.messageCount.Store(0)
 			bc.lastReset = time.Now()
@@ -452,7 +488,7 @@ func (bc *BinanceClient) GetMessageRate() float64 {
 
 // Close closes the WebSocket connection
 func (bc *BinanceClient) Close() error {
-	bc.logger.Info("Closing Binance WebSocket connection...")
+	// bc.logger.Info("Closing Binance WebSocket connection...")
 	
 	bc.connected.Store(false)
 	close(bc.done)
@@ -475,7 +511,7 @@ func (bc *BinanceClient) Close() error {
 		}
 	}
 	
-	bc.logger.Info("Binance WebSocket connection closed")
+	// bc.logger.Info("Binance WebSocket connection closed")
 	return nil
 }
 

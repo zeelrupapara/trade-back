@@ -43,7 +43,6 @@ func NewManager(mysql *database.MySQLClient, logger *logrus.Logger) *Manager {
 
 // Initialize loads all symbols from database and syncs with exchange
 func (m *Manager) Initialize(ctx context.Context) error {
-	m.logger.Info("Initializing symbols manager...")
 	
 	// First sync symbols from Binance
 	if err := m.SyncBinanceSymbols(ctx); err != nil {
@@ -55,7 +54,6 @@ func (m *Manager) Initialize(ctx context.Context) error {
 		return fmt.Errorf("failed to load symbols: %w", err)
 	}
 	
-	m.logger.WithField("count", len(m.symbols)).Info("Symbols loaded successfully")
 	return nil
 }
 
@@ -89,7 +87,7 @@ func (m *Manager) LoadSymbols(ctx context.Context) error {
 	m.logger.WithFields(logrus.Fields{
 		"total":  len(m.symbols),
 		"active": len(m.activeSymbols),
-	}).Info("Symbols loaded from database")
+	})
 	
 	return nil
 }
@@ -208,7 +206,7 @@ func (m *Manager) AddOrUpdateSymbol(ctx context.Context, symbol *models.SymbolIn
 	m.logger.WithFields(logrus.Fields{
 		"symbol": symbol.Symbol,
 		"active": symbol.IsActive,
-	}).Info("Symbol added/updated")
+	})
 	
 	return nil
 }
@@ -237,7 +235,7 @@ func (m *Manager) SetSymbolActive(ctx context.Context, symbol string, active boo
 	m.logger.WithFields(logrus.Fields{
 		"symbol": symbol,
 		"active": active,
-	}).Info("Symbol active status updated")
+	})
 	
 	return nil
 }
@@ -308,7 +306,6 @@ func contains(s, substr string) bool {
 
 // SyncBinanceSymbols fetches all symbols from Binance and updates the database
 func (m *Manager) SyncBinanceSymbols(ctx context.Context) error {
-	m.logger.Info("Syncing symbols from Binance exchange...")
 	
 	// Fetch exchange info from Binance
 	endpoint := "https://api.binance.com/api/v3/exchangeInfo"
@@ -333,7 +330,6 @@ func (m *Manager) SyncBinanceSymbols(ctx context.Context) error {
 		return fmt.Errorf("failed to decode response: %w", err)
 	}
 	
-	m.logger.WithField("symbol_count", len(exchangeInfo.Symbols)).Info("Fetched symbols from Binance")
 	
 	// Process each symbol
 	var newSymbols, updatedSymbols int
@@ -401,7 +397,7 @@ func (m *Manager) SyncBinanceSymbols(ctx context.Context) error {
 	m.logger.WithFields(logrus.Fields{
 		"new_symbols":     newSymbols,
 		"updated_symbols": updatedSymbols,
-	}).Info("Binance symbols sync completed")
+	})
 	
 	return nil
 }

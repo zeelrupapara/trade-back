@@ -61,11 +61,10 @@ func (cp *ConnectionPool) Start(ctx context.Context) error {
 		return nil
 	}
 	
-	cp.logger.Info("Starting connection pool...")
+	// cp.logger.Info("Starting connection pool...")
 	
 	// Calculate number of connections needed
 	numConnections := (len(cp.symbols) + cp.maxSymbols - 1) / cp.maxSymbols
-	cp.logger.WithField("connections", numConnections).Info("Creating connections for symbols")
 	
 	// Create connections
 	for i := 0; i < numConnections; i++ {
@@ -87,10 +86,6 @@ func (cp *ConnectionPool) Start(ctx context.Context) error {
 			continue
 		}
 		
-		cp.logger.WithFields(logrus.Fields{
-			"client":  i,
-			"symbols": len(clientSymbols),
-		}).Info("Client connected and subscribed")
 	}
 	
 	cp.running.Store(true)
@@ -112,7 +107,7 @@ func (cp *ConnectionPool) Stop() error {
 		return nil
 	}
 	
-	cp.logger.Info("Stopping connection pool...")
+	// cp.logger.Info("Stopping connection pool...")
 	
 	close(cp.done)
 	cp.running.Store(false)
@@ -132,7 +127,7 @@ func (cp *ConnectionPool) Stop() error {
 	wg.Wait()
 	cp.wg.Wait()
 	
-	cp.logger.Info("Connection pool stopped")
+	// cp.logger.Info("Connection pool stopped")
 	return nil
 }
 
@@ -206,7 +201,6 @@ func (cp *ConnectionPool) reconnectionHandler(ctx context.Context) {
 			
 			client := cp.clients[clientIdx]
 			
-			cp.logger.WithField("client", clientIdx).Info("Attempting to reconnect client")
 			
 			// Exponential backoff
 			attempts := 0
@@ -242,7 +236,6 @@ func (cp *ConnectionPool) reconnectionHandler(ctx context.Context) {
 				end := min(start+cp.maxSymbols, len(cp.symbols))
 				clientSymbols := cp.symbols[start:end]
 				
-				cp.logger.WithField("client", clientIdx).Info("Client reconnected successfully")
 				
 				// Check for gaps and request backfill if needed
 				cp.checkAndBackfill(clientIdx, clientSymbols)
@@ -293,7 +286,7 @@ func (cp *ConnectionPool) monitorConnections(ctx context.Context) {
 				"buffer_size":     stats.Size,
 				"buffer_capacity": stats.Capacity,
 				"messages_total":  stats.TotalMessages,
-			}).Debug("Buffer statistics")
+			})
 		}
 	}
 }
@@ -304,7 +297,6 @@ func (cp *ConnectionPool) checkAndBackfill(clientIdx int, symbols []string) {
 	recentMessages := cp.buffer.GetRecentBySymbols(symbols, 100)
 	
 	if len(recentMessages) == 0 {
-		cp.logger.WithField("client", clientIdx).Info("No recent messages to check for gaps")
 		return
 	}
 	

@@ -41,7 +41,7 @@ func NewDynamicSymbolManager(hub *Hub, redis *cache.RedisClient, logger *logrus.
 
 // Start starts monitoring market watch symbols
 func (dsm *DynamicSymbolManager) Start(ctx context.Context) error {
-	dsm.logger.Info("Starting dynamic symbol manager")
+	// dsm.logger.Info("Starting dynamic symbol manager")
 	
 	// Initial load
 	if err := dsm.updateSubscriptions(ctx); err != nil {
@@ -57,7 +57,7 @@ func (dsm *DynamicSymbolManager) Start(ctx context.Context) error {
 
 // Stop stops the dynamic symbol manager
 func (dsm *DynamicSymbolManager) Stop() {
-	dsm.logger.Info("Stopping dynamic symbol manager")
+	// dsm.logger.Info("Stopping dynamic symbol manager")
 	close(dsm.done)
 	dsm.wg.Wait()
 }
@@ -117,7 +117,7 @@ func (dsm *DynamicSymbolManager) updateSubscriptions(ctx context.Context) error 
 			"removing":  toRemove,
 			"add_count": len(toAdd),
 			"remove_count": len(toRemove),
-		}).Debug("Updating symbol subscriptions")
+		})
 		
 		// Update subscribed symbols map
 		for _, symbol := range toAdd {
@@ -144,7 +144,6 @@ func (dsm *DynamicSymbolManager) updateSubscriptions(ctx context.Context) error 
 
 // getAllMarketWatchSymbols gets all unique symbols from all user market watches
 func (dsm *DynamicSymbolManager) getAllMarketWatchSymbols(ctx context.Context) (map[string]bool, error) {
-	dsm.logger.Debug("Getting all market watch symbols")
 	
 	// Get all session tokens
 	tokens, err := dsm.redis.GetAllSessionTokens(ctx)
@@ -153,10 +152,10 @@ func (dsm *DynamicSymbolManager) getAllMarketWatchSymbols(ctx context.Context) (
 		return nil, err
 	}
 	
-	dsm.logger.WithFields(logrus.Fields{
-		"token_count": len(tokens),
-		"tokens": tokens,
-	}).Debug("Found session tokens")
+	// dsm.logger.WithFields(logrus.Fields{
+	// 	"token_count": len(tokens),
+	// 	"tokens": tokens,
+	// })
 	
 	// Collect all unique symbols
 	uniqueSymbols := make(map[string]bool)
@@ -167,18 +166,17 @@ func (dsm *DynamicSymbolManager) getAllMarketWatchSymbols(ctx context.Context) (
 			continue
 		}
 		
-		dsm.logger.WithFields(logrus.Fields{
-			"token": token,
-			"symbols": symbols,
-			"count": len(symbols),
-		}).Debug("Got market watch for token")
+		// dsm.logger.WithFields(logrus.Fields{
+		// 	"token": token,
+		// 	"symbols": symbols,
+		// 	"count": len(symbols),
+		// })
 		
 		for _, symbol := range symbols {
 			uniqueSymbols[symbol] = true
 		}
 	}
 	
-	dsm.logger.WithField("unique_symbols", len(uniqueSymbols)).Debug("Collected market watch symbols")
 	return uniqueSymbols, nil
 }
 

@@ -90,7 +90,7 @@ func (oa *OHLCVAggregator) Start(ctx context.Context) error {
 	}
 	
 	oa.running = true
-	oa.logger.Info("Starting OHLCV aggregator")
+	// oa.logger.Info("Starting OHLCV aggregator")
 	
 	// Subscribe to price updates
 	if err := oa.subscribeToPrices(); err != nil {
@@ -110,7 +110,7 @@ func (oa *OHLCVAggregator) Stop() error {
 		return nil
 	}
 	
-	oa.logger.Info("Stopping OHLCV aggregator")
+	// oa.logger.Info("Stopping OHLCV aggregator")
 	
 	// Complete all active bars
 	oa.completeAllBars()

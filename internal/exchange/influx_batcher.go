@@ -50,7 +50,6 @@ func NewInfluxBatcher(client *database.InfluxClient, logger *logrus.Logger) *Inf
 func (ib *InfluxBatcher) Start() {
 	ib.wg.Add(1)
 	go ib.flushLoop()
-	ib.logger.Info("InfluxDB batcher started")
 }
 
 // Stop stops the batcher
@@ -60,7 +59,6 @@ func (ib *InfluxBatcher) Stop() {
 	
 	// Flush any remaining data
 	ib.flush()
-	ib.logger.Info("InfluxDB batcher stopped")
 }
 
 // Write adds price data to the batch

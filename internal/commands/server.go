@@ -1,10 +1,14 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/trade-back/internal/app"
@@ -53,6 +57,31 @@ func init() {
 	// Flags are handled directly in runServer
 }
 
+// killPortProcess kills any process listening on the specified port
+func killPortProcess(port int) error {
+	var cmd *exec.Cmd
+	
+	switch runtime.GOOS {
+	case "darwin":
+		// macOS doesn't have xargs -r flag
+		killCmd := fmt.Sprintf("lsof -ti:%d | xargs kill -9 2>/dev/null || true", port)
+		cmd = exec.Command("sh", "-c", killCmd)
+	case "linux":
+		// Linux has xargs -r flag
+		killCmd := fmt.Sprintf("lsof -ti:%d | xargs -r kill -9 2>/dev/null || true", port)
+		cmd = exec.Command("sh", "-c", killCmd)
+	case "windows":
+		// Windows command to find and kill process on port
+		killCmd := fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| find \":%d\" ^| find \"LISTENING\"') do taskkill /F /PID %%a", port)
+		cmd = exec.Command("cmd", "/c", killCmd)
+	default:
+		// Skip for unknown OS
+		return nil
+	}
+	
+	return cmd.Run()
+}
+
 func runServer(cmd *cobra.Command, args []string) error {
 	// Load .env file first
 	if err := config.LoadDotEnv(); err != nil {
@@ -77,6 +106,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 		cfg.Logging.Level = logLevel
 	}
 
+	// Kill any process on the target port before starting
+	if err := killPortProcess(cfg.Server.Port); err != nil {
+		// Log but don't fail - process might not exist
+		fmt.Printf("Note: Could not kill process on port %d: %v\n", cfg.Server.Port, err)
+	}
+
 	// Setup logger
 	log, _ := logger.New(&cfg.Logging)
 	log.Info("🚀 Starting High-Performance Trading Backend Server")
@@ -98,18 +133,36 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Wait for interrupt signal
 	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
 	sig := <-interrupt
 	log.WithField("signal", sig.String()).Info("🛑 Shutdown signal received")
 
-	// Graceful shutdown
-	if err := application.Stop(); err != nil {
-		log.WithError(err).Error("❌ Application shutdown error")
-		return err
+	// Create shutdown context with timeout (5 seconds)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Channel to track shutdown completion
+	shutdownComplete := make(chan struct{})
+
+	// Graceful shutdown in goroutine
+	go func() {
+		if err := application.Stop(); err != nil {
+			log.WithError(err).Error("❌ Application shutdown error")
+		}
+		close(shutdownComplete)
+	}()
+
+	// Wait for shutdown to complete or timeout
+	select {
+	case <-shutdownComplete:
+		log.Info("✅ Application shutdown complete")
+	case <-shutdownCtx.Done():
+		log.Warn("⚠️ Shutdown timeout - forcing exit")
+		// Force exit after timeout
+		os.Exit(1)
 	}
 
-	log.Info("✅ Application shutdown complete")
 	return nil
 }
 

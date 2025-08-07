@@ -93,7 +93,7 @@ func (f *CustomTextFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	}
 	
 	// Build the log line
-	logLine := fmt.Sprintf("%s%s %s%s%s %s%s%s\n",
+	logLine := fmt.Sprintf("%s%s %s%s%s %s%s %s%s\n",
 		"\033[90m", timestamp, "\033[0m", // Gray timestamp
 		levelColor, strings.ToUpper(entry.Level.String()), "\033[0m", // Colored level
 		caller,

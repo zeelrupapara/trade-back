@@ -73,10 +73,10 @@ func (ec *Calculator) Start(ctx context.Context) error {
 	}
 	
 	ec.running = true
-	ec.logger.Info("Starting Enigma calculator")
+	// ec.logger.Info("Starting Enigma calculator")
 	
 	// Load historical ATH/ATL on startup
-	ec.logger.Info("Loading historical ATH/ATL data...")
+	// ec.logger.Info("Loading historical ATH/ATL data...")
 	if err := ec.loadHistoricalExtremes(ctx); err != nil {
 		ec.logger.WithError(err).Warn("Failed to load historical ATH/ATL, will calculate from incoming data")
 	}
@@ -220,13 +220,6 @@ func (ec *Calculator) calculateForSymbol(symbol string) error {
 	symbolData.LastCalc = time.Now()
 	ec.mu.Unlock()
 	
-	ec.logger.WithFields(logrus.Fields{
-		"symbol": symbol,
-		"level":  fmt.Sprintf("%.2f%%", enigma.Level),
-		"price":  symbolData.LastPrice,
-		"ath":    symbolData.ATH,
-		"atl":    symbolData.ATL,
-	}).Debug("Enigma level calculated")
 	
 	return nil
 }
@@ -324,11 +317,6 @@ func (ec *Calculator) updateAllATHATL(ctx context.Context) {
 		}
 		ec.mu.Unlock()
 		
-		ec.logger.WithFields(logrus.Fields{
-			"symbol": symbol,
-			"ath":    ath,
-			"atl":    atl,
-		}).Debug("Updated ATH/ATL")
 	}
 }
 
@@ -385,19 +373,17 @@ func (ec *Calculator) loadHistoricalExtremes(ctx context.Context) error {
 		"ADAUSDT", "DOGEUSDT", "MATICUSDT", "DOTUSDT", "AVAXUSDT",
 	}
 	
-	ec.logger.WithField("symbols", len(commonSymbols)).Info("Loading ATH/ATL for common symbols")
+	// ec.logger.WithField("symbols", len(commonSymbols)).Info("Loading ATH/ATL for common symbols")
 	
 	// Load ATH/ATL for each symbol
 	loadedCount := 0
 	for _, symbol := range commonSymbols {
 		ath, atl, err := ec.influx.GetATHATL(ctx, symbol)
 		if err != nil {
-			ec.logger.WithError(err).WithField("symbol", symbol).Debug("No historical ATH/ATL found")
 			continue
 		}
 		
 		if ath == 0 || atl == 0 {
-			ec.logger.WithField("symbol", symbol).Debug("Invalid ATH/ATL values, skipping")
 			continue
 		}
 		
@@ -413,16 +399,10 @@ func (ec *Calculator) loadHistoricalExtremes(ctx context.Context) error {
 		ec.mu.Unlock()
 		
 		loadedCount++
-		ec.logger.WithFields(logrus.Fields{
-			"symbol": symbol,
-			"ath":    fmt.Sprintf("%.8f", ath),
-			"atl":    fmt.Sprintf("%.8f", atl),
-			"range":  fmt.Sprintf("%.2f%%", ((ath-atl)/atl)*100),
-		}).Debug("Loaded historical ATH/ATL")
 	}
 	
 	if loadedCount > 0 {
-		ec.logger.WithField("loaded", loadedCount).Info("Successfully loaded historical ATH/ATL data")
+		// ec.logger.WithField("loaded", loadedCount).Info("Successfully loaded historical ATH/ATL data")
 	} else {
 		ec.logger.Warn("No historical ATH/ATL data found, will calculate from incoming prices")
 	}

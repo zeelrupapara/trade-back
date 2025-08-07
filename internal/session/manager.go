@@ -48,7 +48,7 @@ func (sm *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("session manager already running")
 	}
 	
-	sm.logger.Info("Starting session manager...")
+	// sm.logger.Info("Starting session manager...")
 	
 	// Load sessions from database
 	if err := sm.loadSessions(); err != nil {
@@ -57,7 +57,7 @@ func (sm *Manager) Start(ctx context.Context) error {
 	
 	sm.running = true
 	
-	sm.logger.Info("Session manager started successfully")
+	// sm.logger.Info("Session manager started successfully")
 	return nil
 }
 
@@ -67,7 +67,7 @@ func (sm *Manager) Stop() error {
 		return nil
 	}
 	
-	sm.logger.Info("Stopping session manager...")
+	// sm.logger.Info("Stopping session manager...")
 	
 	close(sm.done)
 	sm.running = false
@@ -75,7 +75,7 @@ func (sm *Manager) Stop() error {
 	// Wait for goroutines
 	sm.wg.Wait()
 	
-	sm.logger.Info("Session manager stopped successfully")
+	// sm.logger.Info("Session manager stopped successfully")
 	return nil
 }
 
@@ -91,9 +91,9 @@ func (sm *Manager) loadSessions() error {
 	
 	for _, session := range sessions {
 		sm.sessions[session.Name] = session
-		sm.logger.WithFields(logrus.Fields{
-			"name": session.Name,
-		}).Info("Loaded trading session")
+		// sm.logger.WithFields(logrus.Fields{
+		// 	"name": session.Name,
+		// }).Info("Loaded trading session")
 	}
 	
 	return nil

@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 	"github.com/trade-back/internal/cache"
+	"github.com/trade-back/internal/database"
 	"github.com/trade-back/internal/exchange"
 	"github.com/trade-back/internal/messaging"
 	"github.com/trade-back/pkg/models"
@@ -30,10 +31,19 @@ type BinaryManager struct {
 	batchInterval time.Duration
 	heartbeatInt  time.Duration
 	
+	// Subscriber count index for performance
+	subscriberCount map[string]int
+	subscriberMu    sync.RWMutex
+	
+	// Sync status cache for periodic broadcasting
+	syncStatusCache map[string]*models.SyncStatus
+	syncStatusMu    sync.RWMutex
+	
 	// Dependencies
 	hub           *exchange.Hub
 	nats          *messaging.NATSClient
 	redis         *cache.RedisClient
+	mysql         *database.MySQLClient
 	logger        *logrus.Entry
 }
 
@@ -54,21 +64,25 @@ func NewBinaryManager(
 	hub *exchange.Hub,
 	nats *messaging.NATSClient,
 	cache *cache.RedisClient,
+	mysql *database.MySQLClient,
 	logger *logrus.Logger,
 ) *BinaryManager {
 	bm := &BinaryManager{
-		clients:       make(map[*BinaryClient]bool),
-		register:      make(chan *BinaryClient),
-		unregister:    make(chan *BinaryClient),
-		broadcast:     make(chan []byte, 1000),
-		batchQueue:    make(chan *models.PriceData, 10000),
-		batchSize:     50,  // Batch up to 50 price updates
-		batchInterval: 50 * time.Millisecond, // Send batch every 50ms
-		heartbeatInt:  30 * time.Second,
-		hub:           hub,
-		nats:          nats,
-		redis:         cache,
-		logger:        logger.WithField("component", "ws-binary"),
+		clients:         make(map[*BinaryClient]bool),
+		register:        make(chan *BinaryClient),
+		unregister:      make(chan *BinaryClient),
+		broadcast:       make(chan []byte, 1000),
+		batchQueue:      make(chan *models.PriceData, 10000),
+		batchSize:       50,  // Batch up to 50 price updates
+		batchInterval:   50 * time.Millisecond, // Send batch every 50ms
+		heartbeatInt:    30 * time.Second,
+		subscriberCount: make(map[string]int),
+		syncStatusCache: make(map[string]*models.SyncStatus),
+		hub:             hub,
+		nats:            nats,
+		redis:           cache,
+		mysql:           mysql,
+		logger:          logger.WithField("component", "ws-binary"),
 	}
 	
 	// Subscribe to NATS updates
@@ -83,8 +97,10 @@ func NewBinaryManager(
 func (bm *BinaryManager) Run(ctx context.Context) {
 	ticker := time.NewTicker(bm.batchInterval)
 	heartbeat := time.NewTicker(bm.heartbeatInt)
+	syncStatusTicker := time.NewTicker(3 * time.Second) // Broadcast sync status every 3 seconds
 	defer ticker.Stop()
 	defer heartbeat.Stop()
+	defer syncStatusTicker.Stop()
 	
 	var batchBuffer []*models.PriceData
 	
@@ -97,15 +113,33 @@ func (bm *BinaryManager) Run(ctx context.Context) {
 			bm.mu.Lock()
 			bm.clients[client] = true
 			bm.mu.Unlock()
-			bm.logger.Infof("Binary client connected: %s", client.id)
 			
 		case client := <-bm.unregister:
 			if _, ok := bm.clients[client]; ok {
 				bm.mu.Lock()
 				delete(bm.clients, client)
 				bm.mu.Unlock()
+				
+				// Clean up subscriber counts
+				client.mu.RLock()
+				symbols := make([]string, 0, len(client.symbols))
+				for symbol := range client.symbols {
+					symbols = append(symbols, symbol)
+				}
+				client.mu.RUnlock()
+				
+				if len(symbols) > 0 {
+					bm.subscriberMu.Lock()
+					for _, symbol := range symbols {
+						bm.subscriberCount[symbol]--
+						if bm.subscriberCount[symbol] <= 0 {
+							delete(bm.subscriberCount, symbol)
+						}
+					}
+					bm.subscriberMu.Unlock()
+				}
+				
 				close(client.send)
-				bm.logger.Infof("Binary client disconnected: %s", client.id)
 			}
 			
 		case price := <-bm.batchQueue:
@@ -128,6 +162,10 @@ func (bm *BinaryManager) Run(ctx context.Context) {
 			// Send heartbeat to all clients
 			heartbeatData, _ := models.EncodeHeartbeat()
 			bm.broadcastBinary(heartbeatData)
+			
+		case <-syncStatusTicker.C:
+			// Broadcast sync status for all market watch symbols every 3 seconds
+			bm.broadcastSyncStatus()
 			
 		case data := <-bm.broadcast:
 			bm.broadcastBinary(data)
@@ -170,7 +208,15 @@ func (bm *BinaryManager) sendBatch(prices []*models.PriceData) {
 		// Encode and send batch to this client
 		binaryData, err := models.BatchEncodePrices(clientPrices)
 		if err != nil {
-			bm.logger.Infof("Failed to encode price batch for client %s: %v", client.id, err)
+			bm.logger.WithError(err).WithField("client", client.id).Error("Failed to encode price batch")
+			// Send error notification to client
+			if errorData, encErr := models.EncodeError("Failed to encode price data"); encErr == nil {
+				select {
+				case client.send <- errorData:
+				default:
+					// Client buffer full
+				}
+			}
 			continue
 		}
 		
@@ -211,35 +257,141 @@ func (bm *BinaryManager) AddPriceUpdate(price *models.PriceData) {
 	case bm.batchQueue <- price:
 	default:
 		// Queue full, skip this update (prevents blocking)
-		bm.logger.Infof("Binary queue full, skipping price update for %s", price.Symbol)
 	}
 }
 
 // hasSubscribers checks if any client is subscribed to a symbol
 func (bm *BinaryManager) hasSubscribers(symbol string) bool {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	
-	for client := range bm.clients {
-		if client.IsSubscribed(symbol) {
-			return true
-		}
-	}
-	return false
+	bm.subscriberMu.RLock()
+	count := bm.subscriberCount[symbol]
+	bm.subscriberMu.RUnlock()
+	return count > 0
 }
 
 // SendEnigmaUpdate sends Enigma level updates
 func (bm *BinaryManager) SendEnigmaUpdate(enigma *models.EnigmaData) {
 	binaryData, err := models.EncodeEnigmaData(enigma)
 	if err != nil {
-		bm.logger.Infof("Failed to encode enigma data: %v", err)
+		bm.logger.WithError(err).Error("Failed to encode enigma data")
 		return
 	}
 	
-	select {
-	case bm.broadcast <- binaryData:
-	default:
-		bm.logger.Infof("Broadcast channel full, skipping enigma update")
+	// Send to all clients subscribed to this symbol
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	
+	subscribedClients := 0
+	for client := range bm.clients {
+		if client.IsSubscribed(enigma.Symbol) {
+			subscribedClients++
+			select {
+			case client.send <- binaryData:
+			default:
+				// Client buffer full
+			}
+		}
+	}
+	
+}
+
+// SendSyncProgress sends sync progress updates to clients
+func (bm *BinaryManager) SendSyncProgress(symbol string, progress int, totalBars int) {
+	binaryData, err := models.EncodeSyncProgress(symbol, progress, totalBars)
+	if err != nil {
+		bm.logger.WithError(err).Error("Failed to encode sync progress")
+		return
+	}
+	
+	// Send to all clients subscribed to this symbol
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	
+	subscribedClients := 0
+	for client := range bm.clients {
+		if client.IsSubscribed(symbol) {
+			subscribedClients++
+			select {
+			case client.send <- binaryData:
+			default:
+				// Client buffer full
+				bm.logger.Warn("Client buffer full for sync progress")
+			}
+		}
+	}
+	
+	if subscribedClients > 0 {
+		bm.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"progress": progress,
+			"totalBars": totalBars,
+			"clients": subscribedClients,
+		}).Debug("Sent sync progress to WebSocket clients")
+	}
+}
+
+// SendSyncComplete sends sync completion notification
+func (bm *BinaryManager) SendSyncComplete(symbol string, totalBars int, startTime, endTime time.Time) {
+	binaryData, err := models.EncodeSyncComplete(symbol, totalBars, startTime, endTime)
+	if err != nil {
+		return
+	}
+	
+	// Send to all clients subscribed to this symbol
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	
+	for client := range bm.clients {
+		if client.IsSubscribed(symbol) {
+			select {
+			case client.send <- binaryData:
+			default:
+				// Client buffer full
+			}
+		}
+	}
+}
+
+// SendSyncError sends sync error notification
+func (bm *BinaryManager) SendSyncError(symbol string, errorMsg string) {
+	binaryData, err := models.EncodeSyncError(symbol, errorMsg)
+	if err != nil {
+		return
+	}
+	
+	// Send to all clients subscribed to this symbol
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	
+	for client := range bm.clients {
+		if client.IsSubscribed(symbol) {
+			select {
+			case client.send <- binaryData:
+			default:
+				// Client buffer full
+			}
+		}
+	}
+}
+
+// SendSymbolRemoved sends symbol removal notification
+func (bm *BinaryManager) SendSymbolRemoved(sessionToken, symbol string) {
+	binaryData, err := models.EncodeSymbolRemoved(symbol)
+	if err != nil {
+		return
+	}
+	
+	// Send to all clients with the same session token
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	
+	for client := range bm.clients {
+		if client.sessionToken == sessionToken {
+			select {
+			case client.send <- binaryData:
+			default:
+				// Client buffer full
+			}
+		}
 	}
 }
 
@@ -298,7 +450,10 @@ func (c *BinaryClient) WritePump() {
 			}
 			
 			if err := c.conn.WriteMessage(messageType, data); err != nil {
-				c.manager.logger.WithError(err).Error("Write error")
+				// Only log if it's not a normal close
+				if !websocket.IsCloseError(err, websocket.CloseNoStatusReceived, websocket.CloseNormalClosure) {
+					c.manager.logger.WithError(err).Debug("Write error")
+				}
 				return
 			}
 			
@@ -329,8 +484,16 @@ func (c *BinaryClient) ReadPump() {
 	for {
 		messageType, message, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				c.manager.logger.WithError(err).Error("Binary read error")
+			// Check if it's a normal close or an unexpected error
+			if websocket.IsUnexpectedCloseError(err, 
+				websocket.CloseGoingAway, 
+				websocket.CloseAbnormalClosure,
+				websocket.CloseNoStatusReceived,
+				websocket.CloseNormalClosure) {
+				// Only log actual errors, not normal disconnections
+				if !websocket.IsCloseError(err, websocket.CloseNoStatusReceived, websocket.CloseNormalClosure) {
+					c.manager.logger.WithError(err).Debug("WebSocket closed")
+				}
 			}
 			break
 		}
@@ -351,7 +514,6 @@ func (c *BinaryClient) ReadPump() {
 func (c *BinaryClient) handleBinaryMessage(data []byte) {
 	msgType, err := models.GetMessageType(data)
 	if err != nil {
-		c.manager.logger.Infof("Invalid binary message from client %s: %v", c.id, err)
 		return
 	}
 	
@@ -378,8 +540,15 @@ func (c *BinaryClient) Subscribe(symbols []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	
+	// Update subscriber count in manager
+	c.manager.subscriberMu.Lock()
+	defer c.manager.subscriberMu.Unlock()
+	
 	for _, symbol := range symbols {
-		c.symbols[symbol] = true
+		if !c.symbols[symbol] {
+			c.symbols[symbol] = true
+			c.manager.subscriberCount[symbol]++
+		}
 	}
 }
 
@@ -388,8 +557,18 @@ func (c *BinaryClient) Unsubscribe(symbols []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	
+	// Update subscriber count in manager
+	c.manager.subscriberMu.Lock()
+	defer c.manager.subscriberMu.Unlock()
+	
 	for _, symbol := range symbols {
-		delete(c.symbols, symbol)
+		if c.symbols[symbol] {
+			delete(c.symbols, symbol)
+			c.manager.subscriberCount[symbol]--
+			if c.manager.subscriberCount[symbol] <= 0 {
+				delete(c.manager.subscriberCount, symbol)
+			}
+		}
 	}
 }
 
@@ -435,7 +614,6 @@ func (bm *BinaryManager) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	
-	bm.logger.Info("WebSocket connection attempt")
 	
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -443,7 +621,6 @@ func (bm *BinaryManager) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	
-	bm.logger.Info("WebSocket connection upgraded successfully")
 	
 	// Extract session token from header or query parameter
 	sessionToken := r.Header.Get("X-Session-Token")
@@ -454,11 +631,11 @@ func (bm *BinaryManager) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 	clientID := fmt.Sprintf("client-%d", time.Now().UnixNano())
 	client := NewBinaryClient(clientID, sessionToken, conn, bm)
 	
-	bm.logger.WithFields(logrus.Fields{
-		"clientID": clientID,
-		"sessionToken": sessionToken,
-		"hasToken": sessionToken != "",
-	}).Info("New WebSocket client connected")
+	// bm.logger.WithFields(logrus.Fields{
+	// 	"clientID": clientID,
+	// 	"sessionToken": sessionToken,
+	// 	"hasToken": sessionToken != "",
+	// }).Info("New WebSocket client connected")
 	
 	// Register client
 	bm.RegisterClient(client)
@@ -489,12 +666,66 @@ func (bm *BinaryManager) subscribeToUpdates() error {
 		return fmt.Errorf("failed to subscribe to enigma: %w", err)
 	}
 	
+	// Subscribe to sync progress updates
+	if err := bm.nats.SubscribeSyncUpdates(func(symbol string, progress int, totalBars int) {
+		// Cache the sync status
+		bm.syncStatusMu.Lock()
+		bm.syncStatusCache[symbol] = &models.SyncStatus{
+			Symbol:    symbol,
+			Status:    "syncing",
+			Progress:  progress,
+			TotalBars: totalBars,
+			UpdatedAt: time.Now(),
+		}
+		bm.syncStatusMu.Unlock()
+		
+		bm.SendSyncProgress(symbol, progress, totalBars)
+	}); err != nil {
+		return fmt.Errorf("failed to subscribe to sync updates: %w", err)
+	}
+	
+	// Subscribe to sync complete notifications
+	if err := bm.nats.SubscribeSyncComplete(func(symbol string, totalBars int, startTime, endTime time.Time) {
+		// Update cache to completed
+		bm.syncStatusMu.Lock()
+		bm.syncStatusCache[symbol] = &models.SyncStatus{
+			Symbol:    symbol,
+			Status:    "completed",
+			Progress:  100,
+			TotalBars: totalBars,
+			UpdatedAt: time.Now(),
+		}
+		bm.syncStatusMu.Unlock()
+		
+		bm.SendSyncComplete(symbol, totalBars, startTime, endTime)
+	}); err != nil {
+		return fmt.Errorf("failed to subscribe to sync complete: %w", err)
+	}
+	
+	// Subscribe to sync error notifications
+	if err := bm.nats.SubscribeSyncErrors(func(symbol string, errorMsg string) {
+		// Update cache to failed
+		bm.syncStatusMu.Lock()
+		bm.syncStatusCache[symbol] = &models.SyncStatus{
+			Symbol:    symbol,
+			Status:    "failed",
+			Progress:  0,
+			Error:     errorMsg,
+			UpdatedAt: time.Now(),
+		}
+		bm.syncStatusMu.Unlock()
+		
+		bm.SendSyncError(symbol, errorMsg)
+	}); err != nil {
+		return fmt.Errorf("failed to subscribe to sync errors: %w", err)
+	}
+	
 	return nil
 }
 
 // shutdown gracefully shuts down the manager
 func (bm *BinaryManager) shutdown() {
-	bm.logger.Info("Shutting down binary WebSocket manager")
+	// bm.logger.Info("Shutting down binary WebSocket manager")
 	
 	// Close all client connections
 	bm.mu.Lock()
@@ -547,20 +778,20 @@ func (c *BinaryClient) handleTextMessage(data []byte) {
 		
 	case "subscribe":
 		c.Subscribe(msg.Symbols)
-		c.manager.logger.WithFields(logrus.Fields{
-			"client":  c.id,
-			"symbols": msg.Symbols,
-		}).Debug("Client subscribed")
+		// c.manager.logger.WithFields(logrus.Fields{
+		// 	"client":  c.id,
+		// 	"symbols": msg.Symbols,
+		// }).Debug("Client subscribed")
 		
 		// Send current prices for subscribed symbols
 		go c.sendCurrentPrices(msg.Symbols)
 		
 	case "unsubscribe":
 		c.Unsubscribe(msg.Symbols)
-		c.manager.logger.WithFields(logrus.Fields{
-			"client":  c.id,
-			"symbols": msg.Symbols,
-		}).Debug("Client unsubscribed")
+		// c.manager.logger.WithFields(logrus.Fields{
+		// 	"client":  c.id,
+		// 	"symbols": msg.Symbols,
+		// }).Debug("Client unsubscribed")
 		
 	case "ping":
 		// Send pong
@@ -632,22 +863,22 @@ func (bm *BinaryManager) AutoSubscribeSymbol(sessionToken, symbol string) {
 
 // AutoUnsubscribeSymbol automatically unsubscribes all clients with the given session token from a symbol
 func (bm *BinaryManager) AutoUnsubscribeSymbol(sessionToken, symbol string) {
-	bm.logger.WithFields(logrus.Fields{
-		"sessionToken": sessionToken,
-		"symbol": symbol,
-		"clientCount": len(bm.clients),
-	}).Debug("AutoUnsubscribeSymbol called")
+	// bm.logger.WithFields(logrus.Fields{
+	// 	"sessionToken": sessionToken,
+	// 	"symbol": symbol,
+	// 	"clientCount": len(bm.clients),
+	// }).Debug("AutoUnsubscribeSymbol called")
 	
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
 	
 	clientsFound := 0
 	for client := range bm.clients {
-		bm.logger.WithFields(logrus.Fields{
-			"clientToken": client.sessionToken,
-			"targetToken": sessionToken,
-			"match": client.sessionToken == sessionToken,
-		}).Debug("Checking client for auto-unsubscribe")
+		// bm.logger.WithFields(logrus.Fields{
+		// 	"clientToken": client.sessionToken,
+		// 	"targetToken": sessionToken,
+		// 	"match": client.sessionToken == sessionToken,
+		// }).Debug("Checking client for auto-unsubscribe")
 		
 		if client.sessionToken == sessionToken {
 			clientsFound++
@@ -671,11 +902,67 @@ func (bm *BinaryManager) AutoUnsubscribeSymbol(sessionToken, symbol string) {
 		}
 	}
 	
+	// bm.logger.WithFields(logrus.Fields{
+	// 	"sessionToken": sessionToken,
+	// 	"symbol": symbol,
+	// 	"clientsMatched": clientsFound,
+	// }).Debug("AutoUnsubscribeSymbol completed")
+}
+
+// sendInitialSyncStatus sends the current sync status for symbols to a client
+func (bm *BinaryManager) sendInitialSyncStatus(client *BinaryClient, symbols []string) {
+	if client.sessionToken == "" || len(symbols) == 0 {
+		return
+	}
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	// Get sync status from MySQL for all symbols
+	symbolsWithStatus, err := bm.mysql.GetMarketWatchWithSyncStatus(ctx, client.sessionToken)
+	if err != nil {
+		bm.logger.WithError(err).Error("Failed to get sync status from MySQL")
+		return
+	}
+	
+	// Send sync status for each symbol
+	for _, item := range symbolsWithStatus {
+		symbol, ok := item["symbol"].(string)
+		if !ok {
+			continue
+		}
+		
+		// Get sync status and progress
+		syncStatus, _ := item["sync_status"].(string)
+		var progress int
+		if p, ok := item["sync_progress"].(int64); ok {
+			progress = int(p)
+		} else if p, ok := item["sync_progress"].(float64); ok {
+			progress = int(p)
+		}
+		
+		// Send sync progress update
+		if syncStatus == "syncing" || syncStatus == "completed" {
+			bm.SendSyncProgress(symbol, progress, 0)
+		} else if syncStatus == "failed" {
+			// Send sync error
+			if bm.nats != nil {
+				bm.nats.PublishSyncError(symbol, "Sync failed")
+			}
+		}
+		
+		// If completed, also send completion notification
+		if syncStatus == "completed" {
+			endTime := time.Now()
+			startTime := endTime.AddDate(0, 0, -1000) // Approximate
+			bm.SendSyncComplete(symbol, 1000*1440, startTime, endTime)
+		}
+	}
+	
 	bm.logger.WithFields(logrus.Fields{
-		"sessionToken": sessionToken,
-		"symbol": symbol,
-		"clientsMatched": clientsFound,
-	}).Debug("AutoUnsubscribeSymbol completed")
+		"client": client.id,
+		"symbols": len(symbols),
+	}).Debug("Sent initial sync status")
 }
 
 // autoSubscribeMarketWatch automatically subscribes a client to their market watch symbols
@@ -709,16 +996,101 @@ func (bm *BinaryManager) autoSubscribeMarketWatch(client *BinaryClient) {
 		case client.send <- data:
 			// Subscribe the client to all symbols
 			client.Subscribe(symbols)
+			// Load initial sync status into cache
+			go bm.loadInitialSyncStatus(symbols)
 			// Send current prices
 			go client.sendCurrentPrices(symbols)
+			// Send initial sync status for each symbol
+			go bm.sendInitialSyncStatus(client, symbols)
 			
-			bm.logger.WithFields(logrus.Fields{
-				"client": client.id,
-				"symbols": symbols,
-				"count": len(symbols),
-			}).Debug("Auto-subscribed to market watch symbols")
+			// bm.logger.WithFields(logrus.Fields{
+			// 	"client": client.id,
+			// 	"symbols": symbols,
+			// 	"count": len(symbols),
+			// }).Debug("Auto-subscribed to market watch symbols")
 		default:
 			// Client buffer full
 		}
+	}
+}
+
+// broadcastSyncStatus sends sync status updates for all market watch symbols to all clients
+func (bm *BinaryManager) broadcastSyncStatus() {
+	// Get all unique symbols from connected clients
+	symbolsToCheck := make(map[string]bool)
+	
+	bm.mu.RLock()
+	for client := range bm.clients {
+		if client.sessionToken != "" {
+			client.mu.RLock()
+			for symbol := range client.symbols {
+				symbolsToCheck[symbol] = true
+			}
+			client.mu.RUnlock()
+		}
+	}
+	bm.mu.RUnlock()
+	
+	if len(symbolsToCheck) == 0 {
+		return
+	}
+	
+	// Fetch latest sync status from MySQL for all symbols
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	
+	for symbol := range symbolsToCheck {
+		// Check if we have cached status
+		bm.syncStatusMu.RLock()
+		status, hasCached := bm.syncStatusCache[symbol]
+		bm.syncStatusMu.RUnlock()
+		
+		// If no cached status or status is old, fetch from MySQL
+		if !hasCached || time.Since(status.UpdatedAt) > 10*time.Second {
+			// Get sync status from MySQL
+			syncStatus, err := bm.mysql.GetSyncStatus(ctx, symbol)
+			if err != nil {
+				// If error, create a pending status
+				syncStatus = &models.SyncStatus{
+					Symbol:    symbol,
+					Status:    "pending",
+					Progress:  0,
+					TotalBars: 0,
+					UpdatedAt: time.Now(),
+				}
+			}
+			
+			// Update cache
+			bm.syncStatusMu.Lock()
+			bm.syncStatusCache[symbol] = syncStatus
+			bm.syncStatusMu.Unlock()
+			
+			status = syncStatus
+		}
+		
+		// Send sync progress to all subscribed clients
+		if status != nil && status.Status == "syncing" {
+			bm.SendSyncProgress(status.Symbol, status.Progress, status.TotalBars)
+		}
+	}
+}
+
+// loadInitialSyncStatus loads sync status from MySQL for given symbols
+func (bm *BinaryManager) loadInitialSyncStatus(symbols []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	for _, symbol := range symbols {
+		syncStatus, err := bm.mysql.GetSyncStatus(ctx, symbol)
+		if err != nil {
+			// Log error but continue
+			bm.logger.WithError(err).WithField("symbol", symbol).Debug("Failed to get sync status from MySQL")
+			continue
+		}
+		
+		// Cache the status
+		bm.syncStatusMu.Lock()
+		bm.syncStatusCache[symbol] = syncStatus
+		bm.syncStatusMu.Unlock()
 	}
 }

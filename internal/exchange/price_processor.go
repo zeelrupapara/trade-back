@@ -39,7 +39,6 @@ func NewPriceProcessor(hub *Hub, workerCount int) *PriceProcessor {
 
 // Start starts the price processor workers
 func (pp *PriceProcessor) Start() {
-	pp.logger.WithField("workers", pp.workerCount).Info("Starting price processor")
 	
 	// Start worker goroutines
 	for i := 0; i < pp.workerCount; i++ {
@@ -50,17 +49,36 @@ func (pp *PriceProcessor) Start() {
 
 // Stop stops the price processor
 func (pp *PriceProcessor) Stop() {
-	pp.logger.Info("Stopping price processor")
+	// Signal shutdown
 	pp.cancel()
+	
+	// Give a small grace period for ongoing sends to complete
+	time.Sleep(100 * time.Millisecond)
+	
+	// Now close the channel
 	close(pp.priceQueue)
+	
+	// Wait for workers to finish
 	pp.wg.Wait()
 }
 
 // ProcessPrice adds a price to the processing queue
 func (pp *PriceProcessor) ProcessPrice(price *models.PriceData) {
+	// Check if context is cancelled (shutting down)
+	select {
+	case <-pp.ctx.Done():
+		// Processor is shutting down, ignore the price
+		return
+	default:
+		// Continue with processing
+	}
+	
 	select {
 	case pp.priceQueue <- price:
 		// Successfully queued
+	case <-pp.ctx.Done():
+		// Processor is shutting down
+		return
 	default:
 		// Queue full, drop the price update
 		pp.logger.WithField("symbol", price.Symbol).Warn("Price queue full, dropping update")

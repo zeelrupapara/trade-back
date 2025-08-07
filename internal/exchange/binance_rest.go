@@ -168,14 +168,6 @@ func (b *BinanceRESTClient) GetKlinesBatch(ctx context.Context, symbol, interval
 		} else {
 			currentStart = currentEnd
 		}
-
-		// Progress log
-		progress := float64(currentStart-startTime) / float64(endTime-startTime) * 100
-		b.logger.WithFields(logrus.Fields{
-			"symbol":   symbol,
-			"progress": fmt.Sprintf("%.1f%%", progress),
-			"fetched":  len(allKlines),
-		}).Info("Loading historical data")
 	}
 
 	return allKlines, nil

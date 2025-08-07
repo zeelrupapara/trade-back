@@ -44,28 +44,28 @@ docker-build: ## Build Docker image
 	docker build -t trade-back:latest .
 
 docker-up: ## Start all services with Docker Compose
-	docker-compose up -d
+	docker compose up -d
 
 docker-down: ## Stop all services
-	docker-compose down
+	docker compose down
 
 docker-logs: ## Show Docker logs
-	docker-compose logs -f
+	docker compose logs -f
 
 docker-restart: ## Restart services
-	docker-compose restart
+	docker compose restart
 
 docker-clean: ## Clean Docker containers and volumes
-	docker-compose down -v
+	docker compose down -v
 	docker system prune -f
 
 # Database commands
 db-init: ## Initialize databases
 	@echo "Waiting for MySQL to be ready..."
-	@while ! docker-compose exec mysql mysqladmin ping -h"localhost" --silent; do sleep 1; done
+	@while ! docker compose exec mysql mysqladmin ping -h"localhost" --silent; do sleep 1; done
 	@echo "MySQL is ready!"
 	@echo "Creating InfluxDB retention policies..."
-	docker-compose exec influxdb influx setup --skip-verify \
+	docker compose exec influxdb influx setup --skip-verify \
 		--bucket trading \
 		--org trading-org \
 		--password admin123 \
@@ -83,10 +83,10 @@ test-unit: ## Run unit tests
 	go test -v ./tests/unit/...
 
 test-integration: ## Run integration tests (requires Docker)
-	docker-compose up -d
+	docker compose up -d
 	sleep 10
 	go test -v ./tests/integration/...
-	docker-compose down
+	docker compose down
 
 test-performance: ## Run performance tests
 	go test -v -timeout=5m ./tests/performance/...
@@ -94,7 +94,7 @@ test-performance: ## Run performance tests
 # Production commands
 deploy-staging: ## Deploy to staging
 	@echo "Deploying to staging..."
-	docker-compose -f docker-compose.staging.yml up -d
+	docker compose -f docker compose.staging.yml up -d
 
 deploy-prod: ## Deploy to production
 	@echo "Deploying to production..."
@@ -102,10 +102,10 @@ deploy-prod: ## Deploy to production
 
 # Monitoring commands
 logs: ## Show application logs
-	docker-compose logs -f app
+	docker compose logs -f app
 
 monitor: ## Start monitoring stack
-	docker-compose --profile monitoring up -d
+	docker compose --profile monitoring up -d
 
 health-check: ## Check service health
 	@echo "Checking service health..."

@@ -6,13 +6,18 @@ import (
 
 // PriceData represents real-time price information
 type PriceData struct {
-	Symbol     string    `json:"symbol"`
-	Price      float64   `json:"price"`
-	Bid        float64   `json:"bid"`
-	Ask        float64   `json:"ask"`
-	Volume     float64   `json:"volume"`
-	Timestamp  time.Time `json:"timestamp"`
-	Sequence   uint64    `json:"sequence,omitempty"`
+	Symbol        string    `json:"symbol"`
+	Price         float64   `json:"price"`
+	Bid           float64   `json:"bid"`
+	Ask           float64   `json:"ask"`
+	Volume        float64   `json:"volume"`
+	Change24h     float64   `json:"change_24h"`     // 24hr absolute change
+	ChangePercent float64   `json:"change_percent"`  // 24hr percentage change
+	Open24h       float64   `json:"open_24h"`        // 24hr open price
+	High24h       float64   `json:"high_24h"`        // 24hr high
+	Low24h        float64   `json:"low_24h"`         // 24hr low
+	Timestamp     time.Time `json:"timestamp"`
+	Sequence      uint64    `json:"sequence,omitempty"`
 }
 
 // Bar represents OHLCV candlestick data

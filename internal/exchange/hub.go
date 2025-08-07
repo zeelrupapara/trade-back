@@ -3,6 +3,7 @@ package exchange
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,7 @@ type Hub struct {
 	influxBatcher *InfluxBatcher
 	processor    *PriceProcessor
 	dynamicSymbols *DynamicSymbolManager
+	binanceREST  *BinanceRESTClient
 	
 	// Configuration
 	cfg          *config.Config
@@ -44,6 +46,9 @@ type Hub struct {
 	// Error rate limiting
 	lastErrorLog  time.Time
 	errorLogMu    sync.Mutex
+	
+	// Gap filling workers
+	gapWorkers   chan struct{}
 	
 	// Synchronization
 	mu           sync.RWMutex
@@ -67,10 +72,11 @@ type HubStats struct {
 // NewHub creates a new price hub
 func NewHub(cfg *config.Config, logger *logrus.Logger) *Hub {
 	return &Hub{
-		cfg:    cfg,
-		logger: logger.WithField("component", "hub"),
-		stats:  &HubStats{},
-		done:   make(chan struct{}),
+		cfg:        cfg,
+		logger:     logger.WithField("component", "hub"),
+		stats:      &HubStats{},
+		done:       make(chan struct{}),
+		gapWorkers: make(chan struct{}, 5), // Max 5 concurrent gap filling operations
 	}
 }
 
@@ -103,18 +109,21 @@ func (h *Hub) Initialize(
 	
 	// If no market watch symbols, start with empty list
 	if len(symbols) == 0 {
-		h.logger.Info("No market watch symbols found, starting with empty subscription")
+		// h.logger.Info("No market watch symbols found, starting with empty subscription")
 		symbols = []string{} // Empty list
 	}
 	
 	h.symbols = symbols
-	h.logger.WithField("symbols", len(symbols)).Info("Loaded market watch symbols")
+	// h.logger.WithField("symbols", len(symbols)).Info("Loaded market watch symbols")
 	
 	// Create InfluxDB batcher
 	h.influxBatcher = NewInfluxBatcher(h.influx, h.logger.Logger)
 	
 	// Create price processor with 4 workers
 	h.processor = NewPriceProcessor(h, 4)
+	
+	// Create Binance REST client
+	h.binanceREST = NewBinanceRESTClient(h.logger.Logger)
 	
 	// Create connection pool
 	h.pool = NewConnectionPool(symbols, &h.cfg.Exchange, h.logger.Logger)
@@ -134,7 +143,7 @@ func (h *Hub) Start(ctx context.Context) error {
 		return fmt.Errorf("hub already running")
 	}
 	
-	h.logger.Info("Starting price hub...")
+	// h.logger.Info("Starting price hub...")
 	
 	// Start InfluxDB batcher
 	h.influxBatcher.Start()
@@ -166,7 +175,7 @@ func (h *Hub) Start(ctx context.Context) error {
 	h.wg.Add(1)
 	go h.healthChecker(ctx)
 	
-	h.logger.Info("Price hub started successfully")
+	// h.logger.Info("Price hub started successfully")
 	return nil
 }
 
@@ -176,7 +185,7 @@ func (h *Hub) Stop() error {
 		return nil
 	}
 	
-	h.logger.Info("Stopping price hub...")
+	// h.logger.Info("Stopping price hub...")
 	
 	close(h.done)
 	h.running.Store(false)
@@ -198,7 +207,7 @@ func (h *Hub) Stop() error {
 	// Wait for goroutines
 	h.wg.Wait()
 	
-	h.logger.Info("Price hub stopped")
+	// h.logger.Info("Price hub stopped")
 	return nil
 }
 
@@ -354,15 +363,6 @@ func (h *Hub) updateStatistics(ctx context.Context) {
 			h.stats.MessagesPerSecond.Store(messagesPerSecond)
 			lastCount = currentCount
 			
-			// Log statistics every 10 seconds
-			if time.Now().Unix()%10 == 0 {
-				h.logger.WithFields(logrus.Fields{
-					"messages_total":      currentCount,
-					"messages_per_second": messagesPerSecond,
-					"errors":             h.stats.ErrorCount.Load(),
-					"buffer_size":        h.pool.GetBuffer().Size(),
-				}).Info("Hub statistics")
-			}
 		}
 	}
 }
@@ -392,19 +392,29 @@ func (h *Hub) monitorGaps(ctx context.Context) {
 				gaps := buffer.FindGaps(symbol)
 				
 				for _, gap := range gaps {
-					h.logger.WithFields(logrus.Fields{
-						"symbol":    gap.Symbol,
-						"gap_size":  gap.GapSize,
-						"from_seq":  gap.FromSeq,
-						"to_seq":    gap.ToSeq,
-						"duration":  gap.ToTime.Sub(gap.FromTime),
-					}).Warn("Sequence gap detected")
+					// Commented out - too verbose, generates thousands of logs
+					// h.logger.WithFields(logrus.Fields{
+					// 	"symbol":    gap.Symbol,
+					// 	"gap_size":  gap.GapSize,
+					// 	"from_seq":  gap.FromSeq,
+					// 	"to_seq":    gap.ToSeq,
+					// 	"duration":  gap.ToTime.Sub(gap.FromTime),
+					// }).Warn("Sequence gap detected")
 					
-					// TODO: Implement gap filling logic
-					// This could involve:
-					// 1. Requesting historical data from Binance REST API
-					// 2. Filling the gap in InfluxDB
-					// 3. Updating sequence tracking
+					// Implement gap filling logic with bounded concurrency
+					select {
+					case h.gapWorkers <- struct{}{}:
+						go func(g SequenceGap) {
+							defer func() { <-h.gapWorkers }()
+							h.fillGap(g)
+						}(gap)
+					default:
+						// Commented out - too verbose
+						// h.logger.WithFields(logrus.Fields{
+						// 	"symbol": gap.Symbol,
+						// 	"gap_size": gap.GapSize,
+						// }).Warn("Gap worker pool exhausted, skipping gap")
+					}
 				}
 			}
 		}
@@ -425,31 +435,24 @@ func (h *Hub) healthChecker(ctx context.Context) {
 		case <-h.done:
 			return
 		case <-ticker.C:
-			// Check all component health
-			healthy := true
-			
 			// Check MySQL
 			if err := h.mysql.Health(ctx); err != nil {
 				h.logger.WithError(err).Error("MySQL health check failed")
-				healthy = false
 			}
 			
 			// Check InfluxDB
 			if err := h.influx.Health(ctx); err != nil {
 				h.logger.WithError(err).Error("InfluxDB health check failed")
-				healthy = false
 			}
 			
 			// Check Redis
 			if err := h.redis.Health(ctx); err != nil {
 				h.logger.WithError(err).Error("Redis health check failed")
-				healthy = false
 			}
 			
 			// Check NATS
 			if !h.nats.IsConnected() {
 				h.logger.Error("NATS connection lost")
-				healthy = false
 			}
 			
 			// Check connection pool
@@ -463,12 +466,8 @@ func (h *Hub) healthChecker(ctx context.Context) {
 			
 			if activeConnections == 0 {
 				h.logger.Error("No active WebSocket connections")
-				healthy = false
 			}
 			
-			if healthy {
-				h.logger.Debug("All components healthy")
-			}
 		}
 	}
 }
@@ -508,5 +507,125 @@ func (h *Hub) RemoveSymbol(symbol string) error {
 	
 	// TODO: Rebalance connections if needed
 	
+	return nil
+}
+
+// fillGap fills a sequence gap by fetching missing data
+func (h *Hub) fillGap(gap SequenceGap) {
+	// h.logger.WithFields(logrus.Fields{
+	// 	"symbol":   gap.Symbol,
+	// 	"gap_size": gap.GapSize,
+	// 	"from_time": gap.FromTime,
+	// 	"to_time":   gap.ToTime,
+	// }).Info("Filling sequence gap")
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	// Calculate the time range for the gap
+	startTime := gap.FromTime.UnixMilli()
+	endTime := gap.ToTime.UnixMilli()
+	
+	// Fetch historical klines from Binance to fill the gap (1m interval)
+	klines, err := h.binanceREST.GetKlinesBatch(ctx, gap.Symbol, "1m", startTime, endTime)
+	if err != nil {
+		h.logger.WithError(err).WithField("symbol", gap.Symbol).Error("Failed to fetch historical data for gap")
+		return
+	}
+	
+	// Convert klines to price data and store
+	priceCount := 0
+	for _, kline := range klines {
+		// Parse close price
+		closePrice, err := strconv.ParseFloat(kline.Close, 64)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to parse close price")
+			continue
+		}
+		
+		// Parse volume
+		volume, err := strconv.ParseFloat(kline.Volume, 64)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to parse volume")
+			continue
+		}
+		
+		price := &models.PriceData{
+			Symbol:    gap.Symbol,
+			Price:     closePrice,
+			Timestamp: time.Unix(kline.OpenTime/1000, 0),
+			Volume:    volume,
+			Bid:       closePrice, // Approximate with close price
+			Ask:       closePrice, // Approximate with close price
+		}
+		
+		// Store to InfluxDB
+		if err := h.storeToInfluxBatched(price); err != nil {
+			h.logger.WithError(err).WithField("symbol", gap.Symbol).Error("Failed to store gap fill price")
+			continue
+		}
+		
+		// Update cache
+		if err := h.updateCache(price); err != nil {
+			h.logger.WithError(err).WithField("symbol", gap.Symbol).Error("Failed to update cache for gap fill")
+		}
+		
+		priceCount++
+	}
+	
+	// h.logger.WithFields(logrus.Fields{
+	// 	"symbol":      gap.Symbol,
+	// 	"gap_size":    gap.GapSize,
+	// 	"prices_filled": priceCount,
+	// }).Info("Gap filled successfully")
+}
+
+// logErrorRateLimited logs errors with rate limiting to prevent log spam
+func (h *Hub) logErrorRateLimited(err error, message string) {
+	h.errorLogMu.Lock()
+	defer h.errorLogMu.Unlock()
+	
+	// Only log once per second
+	if time.Since(h.lastErrorLog) < time.Second {
+		return
+	}
+	
+	h.lastErrorLog = time.Now()
+	h.logger.WithError(err).Error(message)
+}
+
+// UpdateSymbols dynamically updates the symbols the hub is subscribed to
+func (h *Hub) UpdateSymbols(ctx context.Context, newSymbols []string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	
+	if !h.running.Load() {
+		return fmt.Errorf("hub is not running")
+	}
+	
+	// h.logger.WithField("count", len(newSymbols)).Info("Updating hub symbols")
+	
+	// Create new connection pool first (before stopping old one)
+	newPool := NewConnectionPool(newSymbols, &h.cfg.Exchange, h.logger.Logger)
+	newPool.SetPriceHandler(h.processor.ProcessPrice)
+	
+	// Start new connection pool
+	if err := newPool.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start new connection pool: %w", err)
+	}
+	
+	// Now stop the old pool (after new one is running)
+	oldPool := h.pool
+	if oldPool != nil {
+		if err := oldPool.Stop(); err != nil {
+			h.logger.WithError(err).Error("Failed to stop old connection pool")
+		}
+	}
+	
+	// Atomic update of symbols and pool
+	h.symbols = newSymbols
+	h.pool = newPool
+	
+	// h.logger.WithField("symbols", len(newSymbols)).Info("Hub symbols updated successfully")
 	return nil
 }
