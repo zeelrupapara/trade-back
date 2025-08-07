@@ -422,18 +422,84 @@ func loadMigrations() ([]Migration, error) {
 		return nil, err
 	}
 
-	var migrations []Migration
+	// Group files by version
+	migrationFiles := make(map[string]map[string]string)
 	
 	for _, file := range files {
-		if !strings.HasSuffix(file.Name(), ".sql") {
-			continue
+		filename := file.Name()
+		
+		// Handle .up.sql and .down.sql files
+		if strings.HasSuffix(filename, ".up.sql") {
+			version := strings.TrimSuffix(filename, ".up.sql")
+			if migrationFiles[version] == nil {
+				migrationFiles[version] = make(map[string]string)
+			}
+			migrationFiles[version]["up"] = filepath.Join(migrationPath, filename)
+		} else if strings.HasSuffix(filename, ".down.sql") {
+			version := strings.TrimSuffix(filename, ".down.sql")
+			if migrationFiles[version] == nil {
+				migrationFiles[version] = make(map[string]string)
+			}
+			migrationFiles[version]["down"] = filepath.Join(migrationPath, filename)
+		} else if strings.HasSuffix(filename, ".sql") && !strings.Contains(filename, ".up.") && !strings.Contains(filename, ".down.") {
+			// Handle single .sql files with embedded up/down
+			migration, err := parseMigrationFile(filepath.Join(migrationPath, filename))
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse migration %s: %w", filename, err)
+			}
+			version := migration.Version
+			if migrationFiles[version] == nil {
+				migrationFiles[version] = make(map[string]string)
+			}
+			migrationFiles[version]["single"] = filepath.Join(migrationPath, filename)
 		}
+	}
 
-		migration, err := parseMigrationFile(filepath.Join(migrationPath, file.Name()))
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse migration %s: %w", file.Name(), err)
+	var migrations []Migration
+	
+	for version, files := range migrationFiles {
+		var migration Migration
+		
+		if singleFile, exists := files["single"]; exists {
+			// Parse single file with embedded up/down
+			migration, err = parseMigrationFile(singleFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse migration %s: %w", singleFile, err)
+			}
+		} else {
+			// Parse separate up/down files
+			parts := strings.SplitN(version, "_", 2)
+			versionNum := version
+			name := ""
+			if len(parts) == 2 {
+				versionNum = parts[0]
+				name = parts[1]
+			}
+			
+			migration = Migration{
+				Version: versionNum,
+				Name:    name,
+			}
+			
+			// Read up file
+			if upFile, exists := files["up"]; exists {
+				content, err := ioutil.ReadFile(upFile)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read up file %s: %w", upFile, err)
+				}
+				migration.UpSQL = strings.TrimSpace(string(content))
+			}
+			
+			// Read down file
+			if downFile, exists := files["down"]; exists {
+				content, err := ioutil.ReadFile(downFile)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read down file %s: %w", downFile, err)
+				}
+				migration.DownSQL = strings.TrimSpace(string(content))
+			}
 		}
-
+		
 		migrations = append(migrations, migration)
 	}
 

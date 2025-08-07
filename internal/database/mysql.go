@@ -29,7 +29,12 @@ func NewMySQLClient(cfg *config.MySQLConfig, logger *logrus.Logger) (*MySQLClien
 		cfg.Database,
 	)
 	
-	logger.WithField("dsn", fmt.Sprintf("%s:***@tcp(%s:%d)/%s", cfg.Username, cfg.Host, cfg.Port, cfg.Database)).Debug("Connecting to MySQL")
+	// logger.WithFields(logrus.Fields{
+	// 	"host": cfg.Host,
+	// 	"port": cfg.Port,
+	// 	"database": cfg.Database,
+	// 	"username": cfg.Username,
+	// }).Info("Connecting to MySQL")
 	
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -78,7 +83,6 @@ func (mc *MySQLClient) Health(ctx context.Context) error {
 
 // GetSymbols retrieves all active symbols
 func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, error) {
-	mc.logger.Info("GetSymbols called - START")
 	
 	// Check if db connection exists
 	if mc.db == nil {
@@ -96,7 +100,6 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 		ORDER BY symbol
 	`
 	
-	mc.logger.Info("Executing symbols query")
 	rows, err := mc.db.QueryContext(ctx, query)
 	if err != nil {
 		mc.logger.WithError(err).Error("Failed to query symbols")
@@ -104,7 +107,6 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 	}
 	defer rows.Close()
 	
-	mc.logger.Info("Query executed successfully, scanning rows...")
 	
 	var symbols []*models.SymbolInfo
 	rowCount := 0
@@ -131,10 +133,6 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 		}
 		symbols = append(symbols, symbol)
 		
-		// Log every 100 rows
-		if rowCount % 100 == 0 {
-			mc.logger.WithField("rows_scanned", rowCount).Debug("Scanning rows...")
-		}
 	}
 	
 	if err := rows.Err(); err != nil {
@@ -142,7 +140,39 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 		return nil, err
 	}
 	
-	mc.logger.WithField("count", len(symbols)).Info("GetSymbols completed successfully")
+	return symbols, nil
+}
+
+// GetMarketWatchSymbols retrieves symbols from market watch for a given session
+func (mc *MySQLClient) GetMarketWatchSymbols(ctx context.Context, sessionToken string) ([]string, error) {
+	query := `
+		SELECT s.symbol
+		FROM market_watch mw
+		JOIN symbolsmap s ON mw.symbol_id = s.id
+		WHERE mw.session_token = ? AND s.is_active = true
+		ORDER BY mw.added_at DESC
+	`
+	
+	rows, err := mc.db.QueryContext(ctx, query, sessionToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query market watch symbols: %w", err)
+	}
+	defer rows.Close()
+	
+	var symbols []string
+	for rows.Next() {
+		var symbol string
+		if err := rows.Scan(&symbol); err != nil {
+			return nil, fmt.Errorf("failed to scan symbol: %w", err)
+		}
+		symbols = append(symbols, symbol)
+	}
+	
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+	
+	
 	return symbols, nil
 }
 
@@ -412,4 +442,270 @@ func (mc *MySQLClient) ExecTx(ctx context.Context, fn func(*sql.Tx) error) error
 	}
 	
 	return tx.Commit()
+}
+
+
+// GetMarketWatchWithSyncStatus retrieves market watch symbols with sync status
+func (mc *MySQLClient) GetMarketWatchWithSyncStatus(ctx context.Context, sessionToken string) ([]map[string]interface{}, error) {
+	query := `
+		SELECT s.symbol, mw.sync_status, mw.sync_progress, mw.total_bars,
+		       mw.sync_started_at, mw.sync_completed_at
+		FROM market_watch mw
+		JOIN symbolsmap s ON mw.symbol_id = s.id
+		WHERE mw.session_token = ? AND s.is_active = true
+		ORDER BY mw.added_at DESC
+	`
+	
+	rows, err := mc.db.QueryContext(ctx, query, sessionToken)
+	if err != nil {
+		mc.logger.WithError(err).WithField("token", sessionToken).Error("Failed to query market watch")
+		return nil, fmt.Errorf("failed to query market watch with status: %w", err)
+	}
+	defer rows.Close()
+	
+	var results []map[string]interface{}
+	// mc.logger.WithField("token", sessionToken).Info("Querying market watch symbols")
+	for rows.Next() {
+		var symbol string
+		var syncStatus sql.NullString
+		var syncProgress, totalBars sql.NullInt64
+		var syncStartedAt, syncCompletedAt sql.NullTime
+		
+		if err := rows.Scan(&symbol, &syncStatus, &syncProgress, &totalBars, 
+			&syncStartedAt, &syncCompletedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+		
+		result := map[string]interface{}{
+			"symbol": symbol,
+		}
+		
+		// Add non-null values
+		if syncStatus.Valid {
+			result["sync_status"] = syncStatus.String
+		} else {
+			result["sync_status"] = "pending"
+		}
+		
+		if syncProgress.Valid {
+			result["sync_progress"] = int(syncProgress.Int64)
+		} else {
+			result["sync_progress"] = 0
+		}
+		
+		if totalBars.Valid {
+			result["total_bars"] = int(totalBars.Int64)
+		} else {
+			result["total_bars"] = 0
+		}
+		
+		if syncStartedAt.Valid {
+			result["sync_started_at"] = syncStartedAt.Time
+		}
+		if syncCompletedAt.Valid {
+			result["sync_completed_at"] = syncCompletedAt.Time
+		}
+		
+		results = append(results, result)
+	}
+	
+	// mc.logger.WithFields(logrus.Fields{
+	// 	"token": sessionToken,
+	// 	"count": len(results),
+	// }).Info("Market watch query complete")
+	
+	return results, nil
+}
+
+// AddToMarketWatch adds a symbol to user's market watch
+func (mc *MySQLClient) AddToMarketWatch(ctx context.Context, sessionToken, symbol string) error {
+	// First get the symbol ID
+	var symbolID int
+	query := "SELECT id FROM symbolsmap WHERE symbol = ? AND is_active = true"
+	err := mc.db.QueryRowContext(ctx, query, symbol).Scan(&symbolID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("symbol not found: %s", symbol)
+		}
+		return fmt.Errorf("failed to get symbol ID: %w", err)
+	}
+	
+	// Insert into market_watch table
+	insertQuery := `
+		INSERT INTO market_watch (symbol_id, session_token, sync_status)
+		VALUES (?, ?, 'pending')
+		ON DUPLICATE KEY UPDATE added_at = CURRENT_TIMESTAMP
+	`
+	
+	_, err = mc.db.ExecContext(ctx, insertQuery, symbolID, sessionToken)
+	if err != nil {
+		return fmt.Errorf("failed to add to market watch: %w", err)
+	}
+	
+	return nil
+}
+
+// RemoveFromMarketWatch removes a symbol from user's market watch
+func (mc *MySQLClient) RemoveFromMarketWatch(ctx context.Context, sessionToken, symbol string) error {
+	query := `
+		DELETE mw FROM market_watch mw
+		JOIN symbolsmap s ON mw.symbol_id = s.id
+		WHERE mw.session_token = ? AND s.symbol = ?
+	`
+	
+	result, err := mc.db.ExecContext(ctx, query, sessionToken, symbol)
+	if err != nil {
+		return fmt.Errorf("failed to remove from market watch: %w", err)
+	}
+	
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	
+	if rows == 0 {
+		return fmt.Errorf("symbol not found in market watch")
+	}
+	
+	return nil
+}
+
+// GetPendingSyncSymbols gets all market watch symbols that need syncing
+func (mc *MySQLClient) GetPendingSyncSymbols(ctx context.Context) ([]map[string]interface{}, error) {
+	query := `
+		SELECT s.symbol, mw.session_token, mw.sync_status, mw.added_at
+		FROM market_watch mw
+		JOIN symbolsmap s ON mw.symbol_id = s.id
+		WHERE (mw.sync_status IN ('pending', 'failed') 
+		   OR mw.sync_status IS NULL)
+		   AND s.is_active = true
+		ORDER BY mw.added_at ASC
+	`
+	
+	rows, err := mc.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending sync symbols: %w", err)
+	}
+	defer rows.Close()
+	
+	var results []map[string]interface{}
+	for rows.Next() {
+		var symbol, sessionToken string
+		var syncStatus sql.NullString
+		var addedAt time.Time
+		
+		if err := rows.Scan(&symbol, &sessionToken, &syncStatus, &addedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+		
+		result := map[string]interface{}{
+			"symbol": symbol,
+			"session_token": sessionToken,
+		}
+		
+		if syncStatus.Valid {
+			result["sync_status"] = syncStatus.String
+		} else {
+			result["sync_status"] = "pending"
+		}
+		
+		results = append(results, result)
+	}
+	
+	return results, nil
+}
+
+// GetSyncStatus gets the current sync status for a symbol
+func (mc *MySQLClient) GetSyncStatus(ctx context.Context, symbol string) (*models.SyncStatus, error) {
+	query := `
+		SELECT 
+			s.symbol,
+			COALESCE(ss.status, 'pending') as status,
+			COALESCE(ss.progress, 0) as progress,
+			COALESCE(ss.total_bars, 0) as total_bars,
+			COALESCE(ss.error_message, '') as error,
+			COALESCE(ss.updated_at, NOW()) as updated_at
+		FROM symbolsmap s
+		LEFT JOIN sync_status ss ON s.id = ss.symbol_id
+		WHERE s.symbol = ?
+		LIMIT 1
+	`
+	
+	var status models.SyncStatus
+	var errorMsg sql.NullString
+	
+	err := mc.db.QueryRowContext(ctx, query, symbol).Scan(
+		&status.Symbol,
+		&status.Status,
+		&status.Progress,
+		&status.TotalBars,
+		&errorMsg,
+		&status.UpdatedAt,
+	)
+	
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Symbol not found, return pending status
+			return &models.SyncStatus{
+				Symbol:    symbol,
+				Status:    "pending",
+				Progress:  0,
+				TotalBars: 0,
+				UpdatedAt: time.Now(),
+			}, nil
+		}
+		return nil, fmt.Errorf("failed to get sync status: %w", err)
+	}
+	
+	if errorMsg.Valid {
+		status.Error = errorMsg.String
+	}
+	
+	return &status, nil
+}
+
+// UpdateSyncStatus updates the sync status for a symbol
+func (mc *MySQLClient) UpdateSyncStatus(ctx context.Context, symbol string, status string, progress int, totalBars int, errorMsg string) error {
+	// First get symbol ID
+	var symbolID int
+	err := mc.db.QueryRowContext(ctx, "SELECT id FROM symbolsmap WHERE symbol = ?", symbol).Scan(&symbolID)
+	if err != nil {
+		return fmt.Errorf("failed to get symbol ID: %w", err)
+	}
+	
+	// Update or insert sync status
+	query := `
+		INSERT INTO sync_status (symbol_id, status, progress, total_bars, error_message, updated_at)
+		VALUES (?, ?, ?, ?, ?, NOW())
+		ON DUPLICATE KEY UPDATE
+			status = VALUES(status),
+			progress = VALUES(progress),
+			total_bars = VALUES(total_bars),
+			error_message = VALUES(error_message),
+			updated_at = NOW()
+	`
+	
+	var errorPtr *string
+	if errorMsg != "" {
+		errorPtr = &errorMsg
+	}
+	
+	_, err = mc.db.ExecContext(ctx, query, symbolID, status, progress, totalBars, errorPtr)
+	if err != nil {
+		return fmt.Errorf("failed to update sync status: %w", err)
+	}
+	
+	// Also update market_watch table sync status
+	updateMW := `
+		UPDATE market_watch mw
+		SET sync_status = ?, sync_progress = ?
+		WHERE symbol_id = ?
+	`
+	_, err = mc.db.ExecContext(ctx, updateMW, status, progress, symbolID)
+	if err != nil {
+		// Log but don't fail
+		mc.logger.WithError(err).Warn("Failed to update market_watch sync status")
+	}
+	
+	return nil
 }
