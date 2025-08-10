@@ -93,16 +93,65 @@ func (h *UltraFastHistoricalLoader) LoadHistoricalDataUltraFast(
 		"interval": interval,
 		"days":     days,
 		"workers":  h.maxWorkers,
-	}).Info("Starting ultra-fast historical data sync")
+	}).Info("Starting ultra-fast historical data sync with smart check")
+	
+	// SMART SYNC: Check existing data first
+	existingEarliest, existingLatest, existingCount, err := h.influx.GetDataTimeRange(ctx, symbol)
+	if err != nil {
+		h.logger.WithError(err).Warn("Failed to check existing data, proceeding with full sync")
+	}
+	
+	endTime := time.Now()
+	startTimeTarget := endTime.AddDate(0, 0, -days)
+	originalDays := days
+	
+	// Check if we already have sufficient data
+	if !existingEarliest.IsZero() && !existingLatest.IsZero() {
+		h.logger.WithFields(logrus.Fields{
+			"symbol":           symbol,
+			"existingEarliest": existingEarliest.Format("2006-01-02"),
+			"existingLatest":   existingLatest.Format("2006-01-02"),
+			"existingCount":    existingCount,
+		}).Info("Found existing data in InfluxDB")
+		
+		// If we already have data from the target period
+		if existingEarliest.Before(startTimeTarget) || existingEarliest.Equal(startTimeTarget) {
+			// Check if we need to fill recent gap
+			gapDays := int(time.Since(existingLatest).Hours() / 24)
+			
+			if gapDays <= 1 {
+				h.logger.WithFields(logrus.Fields{
+					"symbol": symbol,
+					"message": "Data is up to date, skipping sync",
+				}).Info("Ultra-fast smart sync: No sync needed")
+				
+				// Send 100% completion
+				if h.nats != nil {
+					h.nats.PublishSyncComplete(symbol, int(existingCount), existingEarliest, existingLatest)
+				}
+				if h.mysql != nil {
+					h.mysql.UpdateSyncStatus(ctx, symbol, "completed", 100, int(existingCount), "")
+				}
+				return nil
+			}
+			
+			// Only sync the gap
+			h.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+				"gapDays": gapDays,
+				"message": "Only syncing recent gap",
+			}).Info("Ultra-fast smart sync: Filling gap")
+			
+			endTime = time.Now()
+			startTimeTarget = existingLatest
+			days = gapDays
+		}
+	}
 	
 	// Update sync status
 	if err := h.mysql.UpdateSyncStatus(ctx, symbol, "syncing", 0, 0, ""); err != nil {
 		h.logger.WithError(err).Warn("Failed to update sync status")
 	}
-	
-	// Calculate time ranges for parallel loading
-	endTime := time.Now()
-	startTimeTarget := endTime.AddDate(0, 0, -days)
 	
 	// Create time chunks for parallel processing
 	chunks := h.createTimeChunks(startTimeTarget, endTime, h.chunkDays)
@@ -167,20 +216,36 @@ func (h *UltraFastHistoricalLoader) LoadHistoricalDataUltraFast(
 		return fmt.Errorf("sync completed with %d errors", len(errors))
 	}
 	
-	// Update final status
+	// Update final status including existing data
 	duration := time.Since(startTime)
-	h.mysql.UpdateSyncStatus(ctx, symbol, "completed", 100, int(h.totalProgress), "")
+	
+	// Get final count including new and existing data
+	finalEarliest, finalLatest, finalCount, _ := h.influx.GetDataTimeRange(ctx, symbol)
+	if finalCount == 0 {
+		finalCount = int64(h.totalProgress) * 1440 // Estimate
+	}
+	
+	h.mysql.UpdateSyncStatus(ctx, symbol, "completed", 100, int(finalCount), "")
 	
 	h.logger.WithFields(logrus.Fields{
-		"symbol":   symbol,
-		"duration": duration,
-		"chunks":   totalChunks,
-		"speed":    fmt.Sprintf("%.2f chunks/sec", float64(totalChunks)/duration.Seconds()),
-	}).Info("Ultra-fast sync completed successfully")
+		"symbol":        symbol,
+		"duration":      duration,
+		"chunks":        totalChunks,
+		"newData":       days != originalDays,
+		"existingCount": existingCount,
+		"finalCount":    finalCount,
+		"speed":         fmt.Sprintf("%.2f chunks/sec", float64(totalChunks)/duration.Seconds()),
+	}).Info("Ultra-fast smart sync completed successfully")
 	
 	// Publish completion via NATS
 	if h.nats != nil {
-		h.nats.PublishSyncComplete(symbol, totalChunks, startTimeTarget, endTime)
+		if finalEarliest.IsZero() {
+			finalEarliest = startTimeTarget
+		}
+		if finalLatest.IsZero() {
+			finalLatest = endTime
+		}
+		h.nats.PublishSyncComplete(symbol, int(finalCount), finalEarliest, finalLatest)
 	}
 	
 	return nil

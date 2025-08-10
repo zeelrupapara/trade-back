@@ -166,7 +166,7 @@ func (rc *RedisClient) GetPrices(ctx context.Context, symbols []string) (map[str
 
 // Bar operations
 
-// SetBars sets OHLCV bars for a symbol
+// SetBars sets OHLCV bars for a symbol with resolution-based TTL
 func (rc *RedisClient) SetBars(ctx context.Context, symbol string, resolution string, bars []*models.Bar) error {
 	key := fmt.Sprintf("bars:%s:%s", symbol, resolution)
 	
@@ -175,7 +175,25 @@ func (rc *RedisClient) SetBars(ctx context.Context, symbol string, resolution st
 		return fmt.Errorf("failed to marshal bars: %w", err)
 	}
 	
-	return rc.client.Set(ctx, key, data, rc.ttl).Err()
+	// Use different TTL based on resolution
+	ttl := rc.getBarsTTL(resolution)
+	return rc.client.Set(ctx, key, data, ttl).Err()
+}
+
+// getBarsTTL returns appropriate TTL based on resolution
+func (rc *RedisClient) getBarsTTL(resolution string) time.Duration {
+	switch resolution {
+	case "1m":
+		return 5 * time.Minute    // Short TTL for 1m data
+	case "5m", "15m", "30m":
+		return 30 * time.Minute   // Medium TTL for intraday
+	case "1h", "2h", "4h":
+		return 2 * time.Hour      // Longer TTL for hourly
+	case "1d", "1D":
+		return 24 * time.Hour     // Daily data can be cached longer
+	default:
+		return 15 * time.Minute   // Default TTL
+	}
 }
 
 // GetBars gets OHLCV bars for a symbol

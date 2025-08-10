@@ -49,6 +49,8 @@ type App struct {
 	historicalLoader *services.OptimizedHistoricalLoader
 	instantEnigma    *services.InstantEnigmaService
 	coingecko        *external.CoinGeckoClient
+	alphaVantage     *external.AlphaVantageClient
+	extremeTracker   *services.UnifiedExtremeTracker
 }
 
 // New creates a new application instance
@@ -333,8 +335,29 @@ func (a *App) initializeExchange() error {
 		return fmt.Errorf("failed to initialize hub: %w", err)
 	}
 	
+	// Create Alpha Vantage client for forex/stocks
+	alphaVantageKey := "demo" // Use demo key, can be configured later
+	a.alphaVantage = external.NewAlphaVantageClient(alphaVantageKey, a.logger)
+	
+	// Create unified extreme tracker
+	a.extremeTracker = services.NewUnifiedExtremeTracker(
+		a.coingecko,
+		a.alphaVantage,
+		a.influxDB,
+		a.mysqlDB,
+		a.redisCache,
+		a.logger,
+	)
+	
 	// Create services
-	a.enigmaCalc = enigma.NewCalculator(a.influxDB, a.redisCache, a.natsClient, &a.cfg.Features, a.logger)
+	a.enigmaCalc = enigma.NewCalculator(
+		a.influxDB,
+		a.redisCache,
+		a.natsClient,
+		a.extremeTracker,
+		&a.cfg.Features,
+		a.logger,
+	)
 	a.ohlcvAgg = aggregation.NewOHLCVAggregator(a.influxDB, a.natsClient, a.logger)
 	
 	// Create session manager
@@ -395,6 +418,7 @@ func (a *App) initializeAPIServer() error {
 		a.historicalLoader,
 		a.instantEnigma,
 		a.hub,
+		a.extremeTracker,
 	)
 	
 	return nil

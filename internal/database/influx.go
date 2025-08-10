@@ -129,7 +129,11 @@ func (ic *InfluxClient) WritePriceBatch(ctx context.Context, prices []*models.Pr
 
 // WriteBar writes OHLCV bar data
 func (ic *InfluxClient) WriteBar(ctx context.Context, bar *models.Bar, resolution string) error {
-	measurement := fmt.Sprintf("ohlcv_%s", resolution)
+	// Use "ohlcv" for 1m data, "ohlcv_<resolution>" for others
+	measurement := "ohlcv"
+	if resolution != "1m" && resolution != "" {
+		measurement = fmt.Sprintf("ohlcv_%s", resolution)
+	}
 	
 	point := influxdb2.NewPoint(
 		measurement,
@@ -161,7 +165,11 @@ func (ic *InfluxClient) WriteBars(ctx context.Context, bars []*models.Bar, resol
 		return nil
 	}
 	
-	measurement := fmt.Sprintf("ohlcv_%s", resolution)
+	// Use "ohlcv" for 1m data, "ohlcv_<resolution>" for others
+	measurement := "ohlcv"
+	if resolution != "1m" && resolution != "" {
+		measurement = fmt.Sprintf("ohlcv_%s", resolution)
+	}
 	
 	// Use the blocking write API for better performance with large batches
 	writeAPI := ic.client.WriteAPIBlocking(ic.org, ic.bucket)
@@ -196,9 +204,30 @@ func (ic *InfluxClient) WriteBars(ctx context.Context, bars []*models.Bar, resol
 	return nil
 }
 
-// GetBars retrieves OHLCV bars for a symbol
+// GetBars retrieves OHLCV bars for a symbol (with smart aggregation from 1m data)
 func (ic *InfluxClient) GetBars(ctx context.Context, symbol string, from, to time.Time, resolution string) ([]*models.Bar, error) {
-	measurement := fmt.Sprintf("ohlcv_%s", resolution)
+	// If resolution is not 1m, try to aggregate from 1m data first
+	if resolution != "1m" && resolution != "" {
+		// Check if we have 1m data for this period
+		hasData, err := ic.has1MinuteData(ctx, symbol, from, to)
+		if err == nil && hasData {
+			ic.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+				"resolution": resolution,
+				"method": "aggregation",
+			}).Debug("Using aggregation from 1m data")
+			// Aggregate from 1m data
+			return ic.aggregateFromOneMinute(ctx, symbol, from, to, resolution)
+		}
+	}
+	
+	// Fallback to direct query (for 1m or if aggregation not possible)
+	measurement := "ohlcv"
+	if resolution == "1m" {
+		measurement = "ohlcv"
+	} else {
+		measurement = fmt.Sprintf("ohlcv_%s", resolution)
+	}
 	
 	query := fmt.Sprintf(`
 		from(bucket: "%s")
@@ -345,6 +374,144 @@ func (ic *InfluxClient) WriteEnigmaData(ctx context.Context, enigma *models.Enig
 	return nil
 }
 
+// GetLatestBar retrieves the most recent bar for a symbol
+func (ic *InfluxClient) GetLatestBar(ctx context.Context, symbol string, interval string) (*models.Bar, error) {
+	query := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: -30d)
+		|> filter(fn: (r) => r._measurement == "ohlcv")
+		|> filter(fn: (r) => r.symbol == "%s")
+		|> filter(fn: (r) => r._field == "close")
+		|> last()
+	`, ic.bucket, symbol)
+	
+	result, err := ic.queryAPI.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest bar: %w", err)
+	}
+	defer result.Close()
+	
+	if !result.Next() {
+		return nil, nil // No data exists
+	}
+	
+	record := result.Record()
+	timestamp := record.Time()
+	
+	// Get the actual OHLCV values for this timestamp
+	barQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: %s, stop: %s)
+		|> filter(fn: (r) => r._measurement == "ohlcv")
+		|> filter(fn: (r) => r.symbol == "%s")
+		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+	`, ic.bucket, 
+		timestamp.Add(-time.Minute).Format(time.RFC3339),
+		timestamp.Add(time.Minute).Format(time.RFC3339),
+		symbol)
+	
+	barResult, err := ic.queryAPI.Query(ctx, barQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query bar details: %w", err)
+	}
+	defer barResult.Close()
+	
+	if !barResult.Next() {
+		return nil, nil
+	}
+	
+	barRecord := barResult.Record()
+	bar := &models.Bar{
+		Symbol:    symbol,
+		Timestamp: timestamp,
+	}
+	
+	if v, ok := barRecord.Values()["open"].(float64); ok {
+		bar.Open = v
+	}
+	if v, ok := barRecord.Values()["high"].(float64); ok {
+		bar.High = v
+	}
+	if v, ok := barRecord.Values()["low"].(float64); ok {
+		bar.Low = v
+	}
+	if v, ok := barRecord.Values()["close"].(float64); ok {
+		bar.Close = v
+	}
+	if v, ok := barRecord.Values()["volume"].(float64); ok {
+		bar.Volume = v
+	}
+	
+	return bar, nil
+}
+
+// GetDataTimeRange retrieves the earliest and latest timestamps for a symbol
+func (ic *InfluxClient) GetDataTimeRange(ctx context.Context, symbol string) (earliest, latest time.Time, count int64, err error) {
+	// Query for earliest timestamp
+	earliestQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: -1000d)
+		|> filter(fn: (r) => r._measurement == "ohlcv")
+		|> filter(fn: (r) => r.symbol == "%s")
+		|> filter(fn: (r) => r._field == "close")
+		|> first()
+	`, ic.bucket, symbol)
+	
+	earliestResult, err := ic.queryAPI.Query(ctx, earliestQuery)
+	if err != nil {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("failed to query earliest: %w", err)
+	}
+	defer earliestResult.Close()
+	
+	if earliestResult.Next() {
+		earliest = earliestResult.Record().Time()
+	}
+	
+	// Query for latest timestamp
+	latestQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: -1000d)
+		|> filter(fn: (r) => r._measurement == "ohlcv")
+		|> filter(fn: (r) => r.symbol == "%s")
+		|> filter(fn: (r) => r._field == "close")
+		|> last()
+	`, ic.bucket, symbol)
+	
+	latestResult, err := ic.queryAPI.Query(ctx, latestQuery)
+	if err != nil {
+		return time.Time{}, time.Time{}, 0, fmt.Errorf("failed to query latest: %w", err)
+	}
+	defer latestResult.Close()
+	
+	if latestResult.Next() {
+		latest = latestResult.Record().Time()
+	}
+	
+	// Count total data points
+	countQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: -1000d)
+		|> filter(fn: (r) => r._measurement == "ohlcv")
+		|> filter(fn: (r) => r.symbol == "%s")
+		|> filter(fn: (r) => r._field == "close")
+		|> count()
+	`, ic.bucket, symbol)
+	
+	countResult, err := ic.queryAPI.Query(ctx, countQuery)
+	if err != nil {
+		return earliest, latest, 0, fmt.Errorf("failed to query count: %w", err)
+	}
+	defer countResult.Close()
+	
+	if countResult.Next() {
+		if v, ok := countResult.Record().Value().(int64); ok {
+			count = v
+		}
+	}
+	
+	return earliest, latest, count, nil
+}
+
 // GetATHATL retrieves all-time high and low for a symbol
 func (ic *InfluxClient) GetATHATL(ctx context.Context, symbol string) (ath, atl float64, err error) {
 	// Query for ATH
@@ -394,14 +561,193 @@ func (ic *InfluxClient) GetATHATL(ctx context.Context, symbol string) (ath, atl 
 	return ath, atl, nil
 }
 
-// CreateContinuousQueries creates continuous queries for data aggregation
-func (ic *InfluxClient) CreateContinuousQueries(ctx context.Context) error {
-	// Note: InfluxDB 2.x uses Tasks instead of continuous queries
-	// This is a placeholder for setting up aggregation tasks
+// has1MinuteData checks if we have 1-minute data for the given period
+func (ic *InfluxClient) has1MinuteData(ctx context.Context, symbol string, from, to time.Time) (bool, error) {
+	query := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: %s, stop: %s)
+		|> filter(fn: (r) => r._measurement == "ohlcv")
+		|> filter(fn: (r) => r.symbol == "%s")
+		|> filter(fn: (r) => r._field == "close")
+		|> count()
+	`, ic.bucket, from.Format(time.RFC3339), to.Format(time.RFC3339), symbol)
 	
-	// Example task creation would be done via the InfluxDB UI or API
-	// Tasks would aggregate tick data into 1m, 5m, 1h, 1d bars
+	result, err := ic.queryAPI.Query(ctx, query)
+	if err != nil {
+		return false, err
+	}
+	defer result.Close()
 	
-	ic.logger.Info("Continuous queries should be set up via InfluxDB UI or API")
-	return nil
+	if result.Next() {
+		if count, ok := result.Record().Value().(int64); ok && count > 0 {
+			return true, nil
+		}
+	}
+	
+	return false, nil
+}
+
+// aggregateFromOneMinute aggregates 1-minute data to higher timeframes
+func (ic *InfluxClient) aggregateFromOneMinute(ctx context.Context, symbol string, from, to time.Time, resolution string) ([]*models.Bar, error) {
+	// Get aggregation window in minutes
+	windowMinutes := ic.getAggregationWindow(resolution)
+	if windowMinutes == 0 {
+		return nil, fmt.Errorf("unsupported resolution: %s", resolution)
+	}
+	
+	// Fetch 1-minute data
+	query := fmt.Sprintf(`
+		from(bucket: "%s")
+		|> range(start: %s, stop: %s)
+		|> filter(fn: (r) => r._measurement == "ohlcv")
+		|> filter(fn: (r) => r.symbol == "%s")
+		|> filter(fn: (r) => r._field == "open" or r._field == "high" or r._field == "low" or r._field == "close" or r._field == "volume")
+		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+		|> sort(columns: ["_time"])
+	`, ic.bucket, from.Format(time.RFC3339), to.Format(time.RFC3339), symbol)
+	
+	result, err := ic.queryAPI.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query 1m data for aggregation: %w", err)
+	}
+	defer result.Close()
+	
+	// Collect all 1-minute bars
+	var oneMinuteBars []*models.Bar
+	for result.Next() {
+		record := result.Record()
+		bar := &models.Bar{
+			Symbol:    symbol,
+			Timestamp: record.Time(),
+		}
+		
+		if v, ok := record.Values()["open"].(float64); ok {
+			bar.Open = v
+		}
+		if v, ok := record.Values()["high"].(float64); ok {
+			bar.High = v
+		}
+		if v, ok := record.Values()["low"].(float64); ok {
+			bar.Low = v
+		}
+		if v, ok := record.Values()["close"].(float64); ok {
+			bar.Close = v
+		}
+		if v, ok := record.Values()["volume"].(float64); ok {
+			bar.Volume = v
+		}
+		
+		oneMinuteBars = append(oneMinuteBars, bar)
+	}
+	
+	if result.Err() != nil {
+		return nil, fmt.Errorf("query error: %w", result.Err())
+	}
+	
+	// Aggregate to target resolution
+	return ic.aggregateBars(oneMinuteBars, windowMinutes), nil
+}
+
+// getAggregationWindow returns the window size in minutes for aggregation
+func (ic *InfluxClient) getAggregationWindow(resolution string) int {
+	switch resolution {
+	case "3m":
+		return 3
+	case "5m":
+		return 5
+	case "15m":
+		return 15
+	case "30m":
+		return 30
+	case "1h":
+		return 60
+	case "2h":
+		return 120
+	case "4h":
+		return 240
+	case "6h":
+		return 360
+	case "8h":
+		return 480
+	case "12h":
+		return 720
+	case "1d", "1D":
+		return 1440
+	case "3d", "3D":
+		return 4320
+	case "1w", "1W":
+		return 10080
+	default:
+		return 0
+	}
+}
+
+// aggregateBars aggregates 1-minute bars into higher timeframe bars
+func (ic *InfluxClient) aggregateBars(oneMinuteBars []*models.Bar, windowMinutes int) []*models.Bar {
+	if len(oneMinuteBars) == 0 {
+		return []*models.Bar{}
+	}
+	
+	var aggregatedBars []*models.Bar
+	var currentBars []*models.Bar
+	var windowStart time.Time
+	
+	for _, bar := range oneMinuteBars {
+		// Align to window boundary
+		barMinute := bar.Timestamp.Truncate(time.Duration(windowMinutes) * time.Minute)
+		
+		// Start new window if needed
+		if windowStart.IsZero() || barMinute.After(windowStart) {
+			// Process previous window
+			if len(currentBars) > 0 {
+				aggregatedBar := ic.combineBarWindow(currentBars, windowStart)
+				aggregatedBars = append(aggregatedBars, aggregatedBar)
+			}
+			
+			// Start new window
+			windowStart = barMinute
+			currentBars = []*models.Bar{bar}
+		} else {
+			// Add to current window
+			currentBars = append(currentBars, bar)
+		}
+	}
+	
+	// Process last window
+	if len(currentBars) > 0 {
+		aggregatedBar := ic.combineBarWindow(currentBars, windowStart)
+		aggregatedBars = append(aggregatedBars, aggregatedBar)
+	}
+	
+	return aggregatedBars
+}
+
+// combineBarWindow combines multiple bars into a single bar
+func (ic *InfluxClient) combineBarWindow(bars []*models.Bar, timestamp time.Time) *models.Bar {
+	if len(bars) == 0 {
+		return nil
+	}
+	
+	aggregated := &models.Bar{
+		Symbol:    bars[0].Symbol,
+		Timestamp: timestamp,
+		Open:      bars[0].Open,                    // First bar's open
+		Close:     bars[len(bars)-1].Close,         // Last bar's close
+		High:      bars[0].High,                    // Initialize with first
+		Low:       bars[0].Low,                     // Initialize with first
+		Volume:    0,                                // Sum all volumes
+	}
+	
+	// Find high, low, and sum volume
+	for _, bar := range bars {
+		if bar.High > aggregated.High {
+			aggregated.High = bar.High
+		}
+		if bar.Low < aggregated.Low {
+			aggregated.Low = bar.Low
+		}
+		aggregated.Volume += bar.Volume
+	}
+	
+	return aggregated
 }

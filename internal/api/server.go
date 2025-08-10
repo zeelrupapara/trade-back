@@ -42,12 +42,14 @@ type Server struct {
 	wsManager     *websocket.BinaryManager
 	historicalLoader *services.OptimizedHistoricalLoader
 	instantEnigma    *services.InstantEnigmaService
-	hub           *exchange.Hub
+	hub              *exchange.Hub
+	extremeTracker   *services.UnifiedExtremeTracker
 	
 	// API handlers
 	tradingViewAPI    *TradingViewAPI
 	webhookHandler    *WebhookHandler
 	historicalHandler *apiHandlers.HistoricalHandler
+	enigmaHandler     *apiHandlers.EnigmaHandler
 }
 
 // NewServer creates a new API server
@@ -63,6 +65,7 @@ func NewServer(
 	historicalLoader *services.OptimizedHistoricalLoader,
 	instantEnigma *services.InstantEnigmaService,
 	hub *exchange.Hub,
+	extremeTracker *services.UnifiedExtremeTracker,
 ) *Server {
 	s := &Server{
 		cfg:        cfg,
@@ -76,6 +79,7 @@ func NewServer(
 		historicalLoader: historicalLoader,
 		instantEnigma: instantEnigma,
 		hub: hub,
+		extremeTracker: extremeTracker,
 	}
 	
 	if wsManager == nil {
@@ -86,6 +90,7 @@ func NewServer(
 	s.tradingViewAPI = NewTradingViewAPI(influxDB, mysqlDB, redisCache, enigmaCalc, logger)
 	s.webhookHandler = NewWebhookHandler(natsClient, &cfg.Webhook, logger)
 	s.historicalHandler = apiHandlers.NewHistoricalHandler(influxDB, mysqlDB, natsClient, logger)
+	s.enigmaHandler = apiHandlers.NewEnigmaHandler(enigmaCalc, extremeTracker, redisCache, logger)
 	
 	// Setup routes
 	s.setupRoutes()
@@ -150,6 +155,11 @@ func (s *Server) setupRoutes() {
 	
 	// Historical data endpoints
 	s.historicalHandler.RegisterRoutes(s.router)
+	
+	// Enigma endpoints
+	if s.enigmaHandler != nil {
+		s.enigmaHandler.RegisterRoutes(s.router)
+	}
 }
 
 // Start starts the HTTP server

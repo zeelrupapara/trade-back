@@ -38,7 +38,7 @@ func NewOptimizedHistoricalLoader(
 	}
 }
 
-// LoadHistoricalDataIncremental loads data from latest to oldest
+// LoadHistoricalDataIncremental loads data from latest to oldest (with smart sync)
 func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 	ctx context.Context, 
 	symbol string, 
@@ -49,10 +49,85 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 		"symbol":    symbol,
 		"interval":  interval,
 		"totalDays": totalDays,
-	})
+	}).Info("Starting smart historical sync")
 
+	// SMART SYNC: Check existing data first
+	existingEarliest, existingLatest, existingCount, err := h.influx.GetDataTimeRange(ctx, symbol)
+	if err != nil {
+		h.logger.WithError(err).Warn("Failed to check existing data, proceeding with full sync")
+	}
+	
 	endTime := time.Now()
+	targetStartTime := endTime.AddDate(0, 0, -totalDays)
 	daysLoaded := 0
+	existingDataDays := 0
+	
+	// Check if we already have sufficient data
+	if !existingEarliest.IsZero() && !existingLatest.IsZero() {
+		existingDataDays = int(existingLatest.Sub(existingEarliest).Hours() / 24)
+		
+		h.logger.WithFields(logrus.Fields{
+			"symbol":           symbol,
+			"existingEarliest": existingEarliest.Format("2006-01-02"),
+			"existingLatest":   existingLatest.Format("2006-01-02"),
+			"existingDays":     existingDataDays,
+			"existingCount":    existingCount,
+		}).Info("Found existing data in InfluxDB")
+		
+		// If we already have data from the target period
+		if existingEarliest.Before(targetStartTime) || existingEarliest.Equal(targetStartTime) {
+			// Check if we need to fill recent gap
+			gapDays := int(time.Since(existingLatest).Hours() / 24)
+			
+			if gapDays <= 1 {
+				h.logger.WithFields(logrus.Fields{
+					"symbol": symbol,
+					"message": "Data is up to date, skipping sync",
+				}).Info("Smart sync: No sync needed")
+				
+				// Send 100% completion
+				if h.nats != nil {
+					h.nats.PublishSyncComplete(symbol, int(existingCount), existingEarliest, existingLatest)
+				}
+				if h.mysql != nil {
+					h.mysql.UpdateSyncStatus(ctx, symbol, "completed", 100, int(existingCount), "")
+				}
+				return nil
+			}
+			
+			// Only sync the gap
+			h.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+				"gapDays": gapDays,
+				"message": "Only syncing recent gap",
+			}).Info("Smart sync: Filling gap")
+			
+			endTime = time.Now()
+			targetStartTime = existingLatest
+			totalDays = gapDays
+		} else {
+			// We need older data, adjust the sync period
+			if !existingEarliest.IsZero() {
+				// Calculate how many more days we need before existing data
+				additionalDaysNeeded := int(existingEarliest.Sub(targetStartTime).Hours() / 24)
+				
+				h.logger.WithFields(logrus.Fields{
+					"symbol": symbol,
+					"additionalDaysNeeded": additionalDaysNeeded,
+					"message": "Syncing older data to extend coverage",
+				}).Info("Smart sync: Extending historical range")
+				
+				// Sync the older data
+				endTime = existingEarliest
+				totalDays = additionalDaysNeeded
+			}
+		}
+	} else {
+		h.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"message": "No existing data found, performing full sync",
+		}).Info("Smart sync: Full sync required")
+	}
 	
 	// Calculate expected total klines based on interval
 	// For 1m interval: 1440 klines per day (24 * 60)
@@ -80,8 +155,29 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 		expectedKlinesPerDay = 1440 // Default to 1m
 	}
 	
-	expectedTotalKlines := totalDays * expectedKlinesPerDay
+	// Adjust expected klines based on what we're actually syncing
+	expectedNewKlines := totalDays * expectedKlinesPerDay
 	actualKlinesLoaded := 0
+	
+	// If we have existing data, include it in progress calculation
+	totalExpectedKlines := expectedNewKlines
+	baseProgressOffset := 0
+	
+	if existingCount > 0 {
+		// Calculate total expected including existing
+		originalTotalDays := int(time.Since(targetStartTime).Hours() / 24)
+		totalExpectedKlines = originalTotalDays * expectedKlinesPerDay
+		
+		// Calculate base progress from existing data
+		baseProgressOffset = int((float64(existingCount) / float64(totalExpectedKlines)) * 100)
+		
+		h.logger.WithFields(logrus.Fields{
+			"existingCount": existingCount,
+			"expectedNew": expectedNewKlines,
+			"totalExpected": totalExpectedKlines,
+			"baseProgress": baseProgressOffset,
+		}).Info("Smart sync: Calculated progress offsets")
+	}
 	
 	// Load data in chunks from latest to oldest
 	for daysLoaded < totalDays {
@@ -115,8 +211,8 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 			}
 			// Update database with error status
 			if h.mysql != nil {
-				currentProgress := int((float64(actualKlinesLoaded) / float64(expectedTotalKlines)) * 100)
-				h.mysql.UpdateSyncStatus(ctx, symbol, "failed", currentProgress, expectedTotalKlines, errorMsg)
+				currentProgress := int((float64(actualKlinesLoaded) / float64(totalExpectedKlines)) * 100)
+				h.mysql.UpdateSyncStatus(ctx, symbol, "failed", currentProgress, totalExpectedKlines, errorMsg)
 			}
 			return fmt.Errorf("failed to fetch klines for chunk: %w", err)
 		}
@@ -133,12 +229,14 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 		daysLoaded += chunkDays
 		endTime = startTime
 		
-		// Calculate REAL progress percentage based on actual klines loaded
-		// This gives accurate percentage even if some klines are missing
-		progress := 0
-		if expectedTotalKlines > 0 {
-			progress = int((float64(actualKlinesLoaded) / float64(expectedTotalKlines)) * 100)
-			// Cap at 99% until actually complete (to handle missing data)
+		// Calculate REAL progress percentage including existing data
+		progress := baseProgressOffset
+		if expectedNewKlines > 0 {
+			// Add progress from new data to base
+			newDataProgress := int((float64(actualKlinesLoaded) / float64(expectedNewKlines)) * float64(100 - baseProgressOffset))
+			progress = baseProgressOffset + newDataProgress
+			
+			// Cap at 99% until actually complete
 			if progress > 99 && daysLoaded < totalDays {
 				progress = 99
 			}
@@ -148,20 +246,20 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 			"symbol":   symbol,
 			"progress": fmt.Sprintf("%d%%", progress),
 			"days":     fmt.Sprintf("%d/%d", daysLoaded, totalDays),
-			"klines":   fmt.Sprintf("%d/%d", actualKlinesLoaded, expectedTotalKlines),
+			"klines":   fmt.Sprintf("%d/%d", actualKlinesLoaded, totalExpectedKlines),
 		}).Info("Sync progress")
 		
 		// Send progress update via NATS with REAL data
 		if h.nats != nil {
 			// Send actual progress and total expected klines
-			if err := h.nats.PublishSyncProgress(symbol, progress, expectedTotalKlines); err != nil {
+			if err := h.nats.PublishSyncProgress(symbol, progress, totalExpectedKlines); err != nil {
 				h.logger.WithError(err).Warn("Failed to publish sync progress")
 			}
 		}
 		
 		// Also update in database for persistence
 		if h.mysql != nil {
-			if err := h.mysql.UpdateSyncStatus(ctx, symbol, "syncing", progress, expectedTotalKlines, ""); err != nil {
+			if err := h.mysql.UpdateSyncStatus(ctx, symbol, "syncing", progress, totalExpectedKlines, ""); err != nil {
 				h.logger.WithError(err).Warn("Failed to update sync status in database")
 			}
 		}
@@ -170,27 +268,40 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 		time.Sleep(100 * time.Millisecond)
 	}
 	
+	// Calculate final totals including existing data
+	finalTotalBars := actualKlinesLoaded
+	if existingCount > 0 {
+		finalTotalBars = int(existingCount) + actualKlinesLoaded
+	}
+	
 	// Send completion notification with ACTUAL data
 	if h.nats != nil {
-		endTime := time.Now()
-		startTime := endTime.AddDate(0, 0, -totalDays)
+		// Get actual date range
+		finalEarliest, finalLatest, _, _ := h.influx.GetDataTimeRange(ctx, symbol)
+		if finalEarliest.IsZero() {
+			finalEarliest = time.Now().AddDate(0, 0, -totalDays)
+		}
+		if finalLatest.IsZero() {
+			finalLatest = time.Now()
+		}
 		
-		// Send actual klines loaded as totalBars
-		if err := h.nats.PublishSyncComplete(symbol, actualKlinesLoaded, startTime, endTime); err != nil {
+		// Send total bars including existing
+		if err := h.nats.PublishSyncComplete(symbol, finalTotalBars, finalEarliest, finalLatest); err != nil {
 			h.logger.WithError(err).Warn("Failed to publish sync complete")
 		}
 		
 		h.logger.WithFields(logrus.Fields{
 			"symbol": symbol,
-			"totalKlinesLoaded": actualKlinesLoaded,
-			"expectedKlines": expectedTotalKlines,
-			"completionRate": fmt.Sprintf("%.2f%%", (float64(actualKlinesLoaded)/float64(expectedTotalKlines))*100),
-		}).Info("Sync completed")
+			"newKlinesLoaded": actualKlinesLoaded,
+			"existingKlines": existingCount,
+			"totalKlines": finalTotalBars,
+			"smartSync": existingCount > 0,
+		}).Info("Smart sync completed")
 	}
 	
 	// Update database with final 100% progress
 	if h.mysql != nil {
-		if err := h.mysql.UpdateSyncStatus(ctx, symbol, "completed", 100, actualKlinesLoaded, ""); err != nil {
+		if err := h.mysql.UpdateSyncStatus(ctx, symbol, "completed", 100, finalTotalBars, ""); err != nil {
 			h.logger.WithError(err).Warn("Failed to update sync completion in database")
 		}
 	}

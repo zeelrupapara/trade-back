@@ -17,11 +17,12 @@ import (
 
 // HistoricalHandler handles historical data API requests
 type HistoricalHandler struct {
-	loader *services.HistoricalLoader
-	influx *database.InfluxClient
-	mysql  *database.MySQLClient
-	nats   *messaging.NATSClient
-	logger *logrus.Entry
+	loader          *services.HistoricalLoader
+	optimizedLoader *services.OptimizedHistoricalLoader
+	influx          *database.InfluxClient
+	mysql           *database.MySQLClient
+	nats            *messaging.NATSClient
+	logger          *logrus.Entry
 }
 
 // NewHistoricalHandler creates a new historical data handler
@@ -32,11 +33,12 @@ func NewHistoricalHandler(
 	logger *logrus.Logger,
 ) *HistoricalHandler {
 	return &HistoricalHandler{
-		loader: services.NewHistoricalLoader(influx, mysql, logger),
-		influx: influx,
-		mysql:  mysql,
-		nats:   nats,
-		logger: logger.WithField("component", "historical-api"),
+		loader:          services.NewHistoricalLoader(influx, mysql, logger),
+		optimizedLoader: services.NewOptimizedHistoricalLoader(influx, mysql, nats, logger),
+		influx:          influx,
+		mysql:           mysql,
+		nats:            nats,
+		logger:          logger.WithField("component", "historical-api"),
 	}
 }
 
@@ -101,7 +103,8 @@ func (h *HistoricalHandler) BackfillSymbol(w http.ResponseWriter, r *http.Reques
 			"task_id":  taskID,
 		})
 
-		if err := h.loader.LoadHistoricalData(ctx, req.Symbol, req.Interval, req.Days); err != nil {
+		// Use optimized loader with smart sync
+		if err := h.optimizedLoader.LoadHistoricalDataIncremental(ctx, req.Symbol, req.Interval, req.Days); err != nil {
 			h.logger.WithError(err).WithField("task_id", taskID).Error("Symbol backfill failed")
 			// In production, you would update task status in database
 		} else {
@@ -169,7 +172,8 @@ func (h *HistoricalHandler) BackfillAll(w http.ResponseWriter, r *http.Request) 
 			"task_id":  taskID,
 		})
 
-		if err := h.loader.LoadAllSymbols(ctx, req.Interval, req.Days); err != nil {
+		// Use optimized loader for parallel processing
+		if err := h.optimizedLoader.LoadAllSymbolsParallel(ctx, req.Interval, req.Days); err != nil {
 			h.logger.WithError(err).WithField("task_id", taskID).Error("All symbols backfill failed")
 		} else {
 		}

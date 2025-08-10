@@ -151,6 +151,19 @@ func (nc *NATSClient) initializeStreams() error {
 		return fmt.Errorf("failed to create SYSTEM stream: %w", err)
 	}
 	
+	// Sync stream for historical data sync progress
+	_, err = nc.js.AddStream(&nats.StreamConfig{
+		Name:     "SYNC",
+		Subjects: []string{"sync.>"},
+		Storage:  nats.MemoryStorage,
+		MaxAge:   1 * time.Hour,
+		MaxMsgs:  10000,
+		Replicas: 1,
+	})
+	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
+		return fmt.Errorf("failed to create SYNC stream: %w", err)
+	}
+	
 	// nc.logger.Info("JetStream streams initialized")
 	return nil
 }

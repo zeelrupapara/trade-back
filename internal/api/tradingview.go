@@ -172,13 +172,13 @@ func (tv *TradingViewAPI) handleHistory(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_, err := strconv.ParseInt(fromStr, 10, 64)
+	from, err := strconv.ParseInt(fromStr, 10, 64)
 	if err != nil {
 		tv.sendError(w, "Invalid from timestamp", http.StatusBadRequest)
 		return
 	}
 
-	_, err = strconv.ParseInt(toStr, 10, 64)
+	to, err := strconv.ParseInt(toStr, 10, 64)
 	if err != nil {
 		tv.sendError(w, "Invalid to timestamp", http.StatusBadRequest)
 		return
@@ -191,23 +191,41 @@ func (tv *TradingViewAPI) handleHistory(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// TODO: Implement QueryBars method in InfluxClient
-	bars := []models.Bar{}
-	err = nil
-
+	// Fetch bars from InfluxDB using the GetBars method with aggregation support
+	ctx := r.Context()
+	fromTime := time.Unix(from, 0)
+	toTime := time.Unix(to, 0)
+	
+	// Convert resolution to interval format (e.g., "5" -> "5m", "60" -> "1h")
+	interval := resolution
+	switch resolution {
+	case "1":
+		interval = "1m"
+	case "5":
+		interval = "5m"
+	case "15":
+		interval = "15m"
+	case "30":
+		interval = "30m"
+	case "60":
+		interval = "1h"
+	case "240":
+		interval = "4h"
+	case "D":
+		interval = "1d"
+	case "W":
+		interval = "1w"
+	}
+	
+	bars, err := tv.influxDB.GetBars(ctx, symbol, fromTime, toTime, interval)
 	if err != nil {
 		tv.logger.WithError(err).Error("Failed to query bars")
 		tv.sendError(w, "Failed to fetch data", http.StatusInternalServerError)
 		return
 	}
 
-	// Convert to TradingView format
-	// Convert []models.Bar to []*models.Bar
-	barsPtr := make([]*models.Bar, len(bars))
-	for i := range bars {
-		barsPtr[i] = &bars[i]
-	}
-	response := tv.barsToTradingViewFormat(barsPtr)
+	// bars is already []*models.Bar from GetBars, no conversion needed
+	response := tv.barsToTradingViewFormat(bars)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
