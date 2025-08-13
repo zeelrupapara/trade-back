@@ -89,7 +89,7 @@ func NewServer(
 	// Initialize API handlers
 	s.tradingViewAPI = NewTradingViewAPI(influxDB, mysqlDB, redisCache, enigmaCalc, logger)
 	s.webhookHandler = NewWebhookHandler(natsClient, &cfg.Webhook, logger)
-	s.historicalHandler = apiHandlers.NewHistoricalHandler(influxDB, mysqlDB, natsClient, logger)
+	s.historicalHandler = apiHandlers.NewHistoricalHandler(influxDB, mysqlDB, natsClient, cfg, logger)
 	s.enigmaHandler = apiHandlers.NewEnigmaHandler(enigmaCalc, extremeTracker, redisCache, logger)
 	
 	// Setup routes
@@ -772,8 +772,10 @@ func (s *Server) fetchMarketData(ctx context.Context, symbols []string) []Market
 			marketSymbol.Bid = priceData.Bid
 			marketSymbol.Ask = priceData.Ask
 			marketSymbol.Volume = priceData.Volume
-			// Note: Additional fields like High, Low, Open are not available in PriceData
-			// These would need to be aggregated separately or fetched from historical data
+			marketSymbol.High = priceData.High24h
+			marketSymbol.Low = priceData.Low24h
+			marketSymbol.Change = priceData.Change24h
+			marketSymbol.ChangePercent = priceData.ChangePercent
 			
 			// Try to get Enigma data
 			if s.instantEnigma != nil && priceData.Price > 0 {

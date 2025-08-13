@@ -19,7 +19,7 @@ import (
 // Hub is the central orchestrator for all price data
 type Hub struct {
 	// Core components
-	pool         *ConnectionPool
+	pool         *MultiExchangeConnectionPool
 	nats         *messaging.NATSClient
 	influx       *database.InfluxClient
 	mysql        *database.MySQLClient
@@ -95,26 +95,53 @@ func (h *Hub) Initialize(
 	// Create dynamic symbol manager
 	h.dynamicSymbols = NewDynamicSymbolManager(h, redis, h.logger.Logger)
 	
-	// Get initial market watch symbols
-	initialSymbols, err := h.dynamicSymbols.getAllMarketWatchSymbols(context.Background())
+	// Get market watch symbols from all sessions
+	marketWatchSymbols, err := h.dynamicSymbols.getAllMarketWatchSymbols(context.Background())
 	if err != nil {
-		return fmt.Errorf("failed to get market watch symbols: %w", err)
+		h.logger.WithError(err).Warn("Failed to get market watch symbols, starting with empty watchlist")
+		marketWatchSymbols = make(map[string]bool)
 	}
 	
-	// Convert map to slice
-	symbols := make([]string, 0, len(initialSymbols))
-	for symbol := range initialSymbols {
-		symbols = append(symbols, symbol)
+	// Get symbol info from database to determine exchange
+	symbolInfoMap := make(map[string]*models.SymbolInfo)
+	allSymbolInfo, err := h.mysql.GetSymbols(context.Background())
+	if err != nil {
+		h.logger.WithError(err).Warn("Failed to get symbol info from database")
+	} else {
+		for _, info := range allSymbolInfo {
+			symbolInfoMap[info.Symbol] = info
+		}
 	}
 	
-	// If no market watch symbols, start with empty list
-	if len(symbols) == 0 {
-		// h.logger.Info("No market watch symbols found, starting with empty subscription")
-		symbols = []string{} // Empty list
+	// Group market watch symbols by exchange
+	binanceSymbols := []string{}
+	oandaSymbols := []string{}
+	
+	for symbol := range marketWatchSymbols {
+		info, exists := symbolInfoMap[symbol]
+		if !exists {
+			// If symbol not in database, default to binance
+			binanceSymbols = append(binanceSymbols, symbol)
+			continue
+		}
+		
+		switch info.Exchange {
+		case "oanda":
+			oandaSymbols = append(oandaSymbols, symbol)
+		default: // binance or unknown
+			binanceSymbols = append(binanceSymbols, symbol)
+		}
 	}
 	
-	h.symbols = symbols
-	// h.logger.WithField("symbols", len(symbols)).Info("Loaded market watch symbols")
+	// Collect all symbols for backward compatibility
+	allSymbolStrings := append(binanceSymbols, oandaSymbols...)
+	h.symbols = allSymbolStrings
+	
+	h.logger.WithFields(logrus.Fields{
+		"total_watchlist": len(allSymbolStrings),
+		"binance":         len(binanceSymbols),
+		"oanda":           len(oandaSymbols),
+	}).Info("Initialized with market watch symbols only")
 	
 	// Create InfluxDB batcher
 	h.influxBatcher = NewInfluxBatcher(h.influx, h.logger.Logger)
@@ -125,8 +152,17 @@ func (h *Hub) Initialize(
 	// Create Binance REST client
 	h.binanceREST = NewBinanceRESTClient(h.logger.Logger)
 	
-	// Create connection pool
-	h.pool = NewConnectionPool(symbols, &h.cfg.Exchange, h.logger.Logger)
+	// Create multi-exchange connection pool
+	h.pool = NewMultiExchangeConnectionPool(h.cfg, h.logger.Logger)
+	
+	// Add exchange symbols to pool
+	if len(binanceSymbols) > 0 {
+		h.pool.AddExchangeSymbols(ExchangeTypeBinance, binanceSymbols)
+	}
+	
+	if len(oandaSymbols) > 0 {
+		h.pool.AddExchangeSymbols(ExchangeTypeOANDA, oandaSymbols)
+	}
 	h.pool.SetPriceHandler(h.processor.ProcessPrice)
 	
 	// Register default handlers
@@ -603,10 +639,57 @@ func (h *Hub) UpdateSymbols(ctx context.Context, newSymbols []string) error {
 		return fmt.Errorf("hub is not running")
 	}
 	
-	// h.logger.WithField("count", len(newSymbols)).Info("Updating hub symbols")
+	// Log watchlist update
+	h.logger.WithField("watchlist_count", len(newSymbols)).Info("Updating streaming symbols to market watch only")
+	
+	// Get symbol info from database to determine exchange for each symbol
+	symbolInfoMap := make(map[string]*models.SymbolInfo)
+	allSymbols, err := h.mysql.GetSymbols(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get symbol info: %w", err)
+	}
+	
+	for _, info := range allSymbols {
+		symbolInfoMap[info.Symbol] = info
+	}
 	
 	// Create new connection pool first (before stopping old one)
-	newPool := NewConnectionPool(newSymbols, &h.cfg.Exchange, h.logger.Logger)
+	newPool := NewMultiExchangeConnectionPool(h.cfg, h.logger.Logger)
+	
+	// Group market watch symbols by exchange
+	binanceSymbols := []string{}
+	oandaSymbols := []string{}
+	
+	for _, symbol := range newSymbols {
+		info, exists := symbolInfoMap[symbol]
+		if !exists {
+			h.logger.WithField("symbol", symbol).Warn("Symbol not found in database")
+			continue
+		}
+		
+		switch info.Exchange {
+		case "oanda":
+			oandaSymbols = append(oandaSymbols, symbol)
+		default: // binance or unknown
+			binanceSymbols = append(binanceSymbols, symbol)
+		}
+	}
+	
+	// Log market watch symbols being streamed
+	h.logger.WithFields(logrus.Fields{
+		"binance_symbols": len(binanceSymbols),
+		"oanda_symbols":   len(oandaSymbols),
+		"total_watchlist": len(binanceSymbols) + len(oandaSymbols),
+	}).Info("Restarting pool with market watch symbols only")
+	
+	// Add symbols to appropriate exchange pools
+	if len(binanceSymbols) > 0 {
+		newPool.AddExchangeSymbols(ExchangeTypeBinance, binanceSymbols)
+	}
+	if len(oandaSymbols) > 0 {
+		newPool.AddExchangeSymbols(ExchangeTypeOANDA, oandaSymbols)
+	}
+	
 	newPool.SetPriceHandler(h.processor.ProcessPrice)
 	
 	// Start new connection pool

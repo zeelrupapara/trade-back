@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS symbolsmap (
     exchange VARCHAR(20) NOT NULL,
     symbol VARCHAR(50) NOT NULL,
     full_name VARCHAR(100),
-    instrument_type ENUM('SPOT', 'FUTURES', 'OPTIONS') DEFAULT 'SPOT',
+    instrument_type ENUM('SPOT', 'FUTURES', 'OPTIONS', 'FOREX', 'CFD') DEFAULT 'SPOT',
     base_currency VARCHAR(50),
     quote_currency VARCHAR(50),
     is_active BOOLEAN DEFAULT TRUE,
@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS symbolsmap (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uk_exchange_symbol (exchange, symbol),
+    INDEX idx_symbol (symbol),
     INDEX idx_active (is_active),
+    INDEX idx_symbol_active (symbol, is_active),
     INDEX idx_currencies (base_currency, quote_currency)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -29,12 +31,15 @@ CREATE TABLE IF NOT EXISTS symbolsmap (
 CREATE TABLE IF NOT EXISTS trading_sessions (
     id INT PRIMARY KEY AUTO_INCREMENT,
     name VARCHAR(50) NOT NULL,
+    market_type ENUM('FOREX', 'CRYPTO', 'STOCK', 'ALL') DEFAULT 'ALL',
     start_time TIME NOT NULL,
     end_time TIME NOT NULL,
     timezone VARCHAR(50) NOT NULL,
     days_active JSON,
     is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_market_type (market_type),
+    INDEX idx_active (is_active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =====================================
@@ -79,6 +84,7 @@ CREATE TABLE IF NOT EXISTS sync_status (
     UNIQUE KEY unique_symbol (symbol_id),
     FOREIGN KEY (symbol_id) REFERENCES symbolsmap(id) ON DELETE CASCADE,
     INDEX idx_status (status),
+    INDEX idx_symbol_status (symbol_id, status),
     INDEX idx_updated_at (updated_at),
     INDEX idx_status_progress (status, progress)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -100,7 +106,9 @@ CREATE TABLE IF NOT EXISTS market_watch (
     FOREIGN KEY (symbol_id) REFERENCES symbolsmap(id) ON DELETE CASCADE,
     UNIQUE KEY uk_token_symbol (session_token, symbol_id),
     INDEX idx_token (session_token),
-    INDEX idx_sync_status (sync_status)
+    INDEX idx_symbol_id (symbol_id),
+    INDEX idx_sync_status (sync_status),
+    INDEX idx_sync_status_progress (sync_status, sync_progress)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =====================================
@@ -123,15 +131,47 @@ CREATE TABLE IF NOT EXISTS sync_checkpoint (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =====================================
--- 8. INSERT DEFAULT DATA
+-- 8. ASSET EXTREMES TABLE
+-- =====================================
+CREATE TABLE IF NOT EXISTS asset_extremes (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    symbol_id INT NOT NULL,
+    exchange VARCHAR(20) NOT NULL,
+    ath DECIMAL(20,10) COMMENT 'All-time high',
+    atl DECIMAL(20,10) COMMENT 'All-time low',
+    ath_date TIMESTAMP NULL COMMENT 'Date of ATH',
+    atl_date TIMESTAMP NULL COMMENT 'Date of ATL',
+    week_52_high DECIMAL(20,10) COMMENT '52-week high',
+    week_52_low DECIMAL(20,10) COMMENT '52-week low',
+    month_high DECIMAL(20,10) COMMENT '30-day high',
+    month_low DECIMAL(20,10) COMMENT '30-day low',
+    day_high DECIMAL(20,10) COMMENT '24-hour high',
+    day_low DECIMAL(20,10) COMMENT '24-hour low',
+    data_source VARCHAR(50) COMMENT 'api, historical, realtime',
+    confidence_score DECIMAL(5,2) DEFAULT 0.00 COMMENT 'Data confidence 0-100',
+    last_calculated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_symbol_exchange (symbol_id, exchange),
+    INDEX idx_symbol_id (symbol_id),
+    INDEX idx_last_calculated (last_calculated),
+    INDEX idx_exchange (exchange),
+    INDEX idx_symbol_last_calc (symbol_id, last_calculated),
+    FOREIGN KEY (symbol_id) REFERENCES symbolsmap(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================
+-- 9. INSERT DEFAULT DATA
 -- =====================================
 
 -- Insert default trading sessions
-INSERT IGNORE INTO trading_sessions (name, start_time, end_time, timezone, days_active) VALUES
-('Asian', '00:00:00', '08:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]'),
-('London', '08:00:00', '16:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday"]'),
-('New York', '13:00:00', '21:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday"]'),
-('Crypto 24/7', '00:00:00', '23:59:59', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]');
+INSERT IGNORE INTO trading_sessions (name, market_type, start_time, end_time, timezone, days_active) VALUES
+-- Forex Market Sessions (Monday to Friday only)
+('Sydney', 'FOREX', '21:00:00', '06:00:00', 'UTC', '["sunday", "monday", "tuesday", "wednesday", "thursday"]'),
+('Tokyo', 'FOREX', '00:00:00', '09:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday"]'),
+('London', 'FOREX', '08:00:00', '17:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday"]'),
+('New York', 'FOREX', '13:00:00', '22:00:00', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday"]'),
+-- Crypto Sessions (24/7)
+('Crypto 24/7', 'CRYPTO', '00:00:00', '23:59:59', 'UTC', '["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]');
 
 -- Insert default system configurations
 INSERT IGNORE INTO system_config (config_key, config_value, description) VALUES
@@ -153,4 +193,16 @@ INSERT IGNORE INTO symbolsmap (exchange, symbol, full_name, instrument_type, bas
 ('binance', 'ETHUSDT', 'Ethereum/USDT', 'SPOT', 'ETH', 'USDT', TRUE),
 ('binance', 'BNBUSDT', 'Binance Coin/USDT', 'SPOT', 'BNB', 'USDT', TRUE),
 ('binance', 'SOLUSDT', 'Solana/USDT', 'SPOT', 'SOL', 'USDT', TRUE),
-('binance', 'XRPUSDT', 'Ripple/USDT', 'SPOT', 'XRP', 'USDT', TRUE);
+('binance', 'XRPUSDT', 'Ripple/USDT', 'SPOT', 'XRP', 'USDT', TRUE),
+-- OANDA Forex Major Pairs
+('oanda', 'EUR_USD', 'Euro/US Dollar', 'FOREX', 'EUR', 'USD', TRUE),
+('oanda', 'GBP_USD', 'British Pound/US Dollar', 'FOREX', 'GBP', 'USD', TRUE),
+('oanda', 'USD_JPY', 'US Dollar/Japanese Yen', 'FOREX', 'USD', 'JPY', TRUE),
+('oanda', 'USD_CHF', 'US Dollar/Swiss Franc', 'FOREX', 'USD', 'CHF', TRUE),
+('oanda', 'AUD_USD', 'Australian Dollar/US Dollar', 'FOREX', 'AUD', 'USD', TRUE),
+('oanda', 'USD_CAD', 'US Dollar/Canadian Dollar', 'FOREX', 'USD', 'CAD', TRUE),
+('oanda', 'NZD_USD', 'New Zealand Dollar/US Dollar', 'FOREX', 'NZD', 'USD', TRUE),
+-- OANDA Cross Pairs
+('oanda', 'EUR_GBP', 'Euro/British Pound', 'FOREX', 'EUR', 'GBP', TRUE),
+('oanda', 'EUR_JPY', 'Euro/Japanese Yen', 'FOREX', 'EUR', 'JPY', TRUE),
+('oanda', 'GBP_JPY', 'British Pound/Japanese Yen', 'FOREX', 'GBP', 'JPY', TRUE);

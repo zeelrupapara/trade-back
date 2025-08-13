@@ -117,7 +117,7 @@ func (dsm *DynamicSymbolManager) updateSubscriptions(ctx context.Context) error 
 			"removing":  toRemove,
 			"add_count": len(toAdd),
 			"remove_count": len(toRemove),
-		})
+		}).Info("Market watch symbols changed, updating streaming")
 		
 		// Update subscribed symbols map
 		for _, symbol := range toAdd {

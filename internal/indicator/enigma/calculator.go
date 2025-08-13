@@ -385,13 +385,27 @@ func (ec *Calculator) updateAllATHATL(ctx context.Context) {
 
 // GetEnigmaLevel gets the current Enigma level for a symbol
 func (ec *Calculator) GetEnigmaLevel(symbol string) (*models.EnigmaData, error) {
-	// Try cache first
-	enigma, err := ec.redis.GetEnigmaLevel(context.Background(), symbol)
-	if err == nil && enigma != nil {
-		return enigma, nil
+	// For crypto assets, always fetch fresh extremes from CoinGecko
+	if ec.extremeTracker != nil {
+		ctx := context.Background()
+		extreme, err := ec.extremeTracker.GetExtremes(ctx, symbol)
+		if err == nil && extreme != nil && extreme.ATH > 0 && extreme.ATL > 0 {
+			// Update the cached data
+			ec.mu.Lock()
+			if _, exists := ec.symbols[symbol]; !exists {
+				ec.symbols[symbol] = &SymbolData{
+					Symbol: symbol,
+				}
+			}
+			ec.symbols[symbol].ATH = extreme.ATH
+			ec.symbols[symbol].ATL = extreme.ATL
+			ec.symbols[symbol].AssetClass = extreme.AssetClass
+			ec.symbols[symbol].DataSource = extreme.DataSource
+			ec.mu.Unlock()
+		}
 	}
 	
-	// Calculate if not in cache
+	// Now use the updated data
 	ec.mu.RLock()
 	symbolData, exists := ec.symbols[symbol]
 	ec.mu.RUnlock()

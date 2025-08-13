@@ -10,6 +10,7 @@ import (
 	"github.com/trade-back/internal/database"
 	"github.com/trade-back/internal/exchange"
 	"github.com/trade-back/internal/messaging"
+	"github.com/trade-back/pkg/config"
 	"github.com/trade-back/pkg/models"
 )
 
@@ -22,15 +23,22 @@ type OptimizedHistoricalLoader struct {
 	nats          *messaging.NATSClient
 }
 
+// isForexSymbol checks if a symbol is a forex pair (contains underscore)
+func (h *OptimizedHistoricalLoader) isForexSymbol(symbol string) bool {
+	// OANDA forex symbols use underscore format like EUR_USD
+	return len(symbol) > 0 && (symbol[3:4] == "_" || (len(symbol) > 4 && symbol[4:5] == "_"))
+}
+
 // NewOptimizedHistoricalLoader creates a new optimized loader
 func NewOptimizedHistoricalLoader(
 	influx *database.InfluxClient,
 	mysql *database.MySQLClient,
 	nats *messaging.NATSClient,
+	config *config.Config,
 	logger *logrus.Logger,
 ) *OptimizedHistoricalLoader {
 	return &OptimizedHistoricalLoader{
-		HistoricalLoader: NewHistoricalLoader(influx, mysql, logger),
+		HistoricalLoader: NewHistoricalLoader(influx, mysql, config, logger),
 		maxWorkers:       10,  // Process 10 symbols concurrently
 		batchSize:        50,  // Process 50 symbols per batch
 		chunkDays:        30,  // Load 30 days at a time
@@ -45,6 +53,9 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 	interval string, 
 	totalDays int,
 ) error {
+	// FOREX symbols now support historical sync via OANDA REST API
+	// No longer skip them
+	
 	h.logger.WithFields(logrus.Fields{
 		"symbol":    symbol,
 		"interval":  interval,
@@ -182,6 +193,17 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 	// Load data in chunks from latest to oldest
 	for daysLoaded < totalDays {
 		chunkDays := h.chunkDays
+		
+		// For OANDA/FOREX symbols with 1m interval, use smaller chunks due to API limits
+		if h.isForexSymbol(symbol) && interval == "1m" {
+			// OANDA has a max of 5000 candles per request
+			// For 1m interval: 5000 / (24*60) = ~3.47 days
+			chunkDays = 3 // Safe limit for 1-minute candles
+		} else if h.isForexSymbol(symbol) {
+			// For other intervals, can use larger chunks
+			chunkDays = 10 // Conservative for other intervals
+		}
+		
 		if daysLoaded + chunkDays > totalDays {
 			chunkDays = totalDays - daysLoaded
 		}
@@ -195,14 +217,31 @@ func (h *OptimizedHistoricalLoader) LoadHistoricalDataIncremental(
 			"endTime":   endTime.Format("2006-01-02"),
 		})
 		
-		// Fetch and store this chunk
-		klines, err := h.binanceREST.GetKlinesBatch(
-			ctx,
-			symbol,
-			interval,
-			startTime.UnixMilli(),
-			endTime.UnixMilli(),
-		)
+		// Determine which exchange API to use based on symbol
+		var klines []exchange.HistoricalKline
+		var err error
+		
+		// Check if symbol is from OANDA (forex symbols with underscore)
+		if h.oandaREST != nil && h.isForexSymbol(symbol) {
+			// For OANDA, we need to use their API
+			klines, err = h.oandaREST.GetKlinesBatch(
+				ctx,
+				symbol,
+				interval,
+				startTime.UnixMilli(),
+				endTime.UnixMilli(),
+			)
+		} else {
+			// Default to Binance for crypto symbols
+			klines, err = h.binanceREST.GetKlinesBatch(
+				ctx,
+				symbol,
+				interval,
+				startTime.UnixMilli(),
+				endTime.UnixMilli(),
+			)
+		}
+		
 		if err != nil {
 			errorMsg := fmt.Sprintf("Failed to fetch klines: %v", err)
 			// Send error notification via WebSocket

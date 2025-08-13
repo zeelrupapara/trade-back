@@ -65,7 +65,10 @@ func (ac *AssetClassifier) ClassifySymbol(symbol string) models.AssetClass {
 	   strings.HasSuffix(symbol, "BTC") || 
 	   strings.HasSuffix(symbol, "ETH") ||
 	   strings.HasSuffix(symbol, "BUSD") ||
-	   strings.HasSuffix(symbol, "USDC") {
+	   strings.HasSuffix(symbol, "USDC") ||
+	   strings.HasSuffix(symbol, "BNB") ||
+	   strings.HasSuffix(symbol, "SOL") ||
+	   strings.HasSuffix(symbol, "DOT") {
 		ac.AddSymbol(symbol, models.AssetClassCrypto)
 		return models.AssetClassCrypto
 	}
@@ -82,8 +85,8 @@ func (ac *AssetClassifier) ClassifySymbol(symbol string) models.AssetClass {
 		}
 	}
 	
-	// Forex with separator (EUR/USD, GBP-USD)
-	forexWithSep := regexp.MustCompile(`^[A-Z]{3}[/\-][A-Z]{3}$`)
+	// Forex with separator (EUR/USD, GBP-USD, EUR_USD)
+	forexWithSep := regexp.MustCompile(`^[A-Z]{3}[/\-_][A-Z]{3}$`)
 	if forexWithSep.MatchString(symbol) {
 		ac.AddSymbol(symbol, models.AssetClassForex)
 		return models.AssetClassForex

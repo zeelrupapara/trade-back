@@ -75,11 +75,19 @@ func (c *CoinGeckoClient) rateLimitWorker() {
 
 // GetATHATL fetches all-time high and low for a symbol
 func (c *CoinGeckoClient) GetATHATL(ctx context.Context, binanceSymbol string) (ath, atl float64, err error) {
+	c.logger.WithField("symbol", binanceSymbol).Info("CoinGecko GetATHATL called")
+	
 	// Convert Binance symbol to CoinGecko ID
 	coinID := c.getCoinGeckoID(binanceSymbol)
 	if coinID == "" {
+		c.logger.WithField("symbol", binanceSymbol).Warn("CoinGecko: unsupported symbol")
 		return 0, 0, fmt.Errorf("unsupported symbol: %s", binanceSymbol)
 	}
+	
+	c.logger.WithFields(logrus.Fields{
+		"symbol": binanceSymbol,
+		"coin_id": coinID,
+	}).Info("CoinGecko: Converted symbol to ID")
 	
 	// Rate limit
 	select {
@@ -138,8 +146,18 @@ func (c *CoinGeckoClient) getCoinGeckoID(binanceSymbol string) string {
 	c.mapMutex.RLock()
 	defer c.mapMutex.RUnlock()
 	
-	// Remove USDT suffix and convert to lowercase
-	base := strings.TrimSuffix(binanceSymbol, "USDT")
+	// Handle different trading pairs
+	base := binanceSymbol
+	
+	// Remove common suffixes
+	suffixes := []string{"USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"}
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(base, suffix) {
+			base = strings.TrimSuffix(base, suffix)
+			break
+		}
+	}
+	
 	base = strings.ToLower(base)
 	
 	if id, exists := c.symbolMap[base]; exists {
@@ -173,6 +191,7 @@ func initializeSymbolMap() map[string]string {
 		"icp":   "internet-computer",
 		"fil":   "filecoin",
 		"etc":   "ethereum-classic",
+		"bnsol": "binance-peg-solana", // BNSOLUSDT
 		// Add more mappings as needed
 	}
 }

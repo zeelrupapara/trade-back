@@ -72,10 +72,16 @@ func (ic *InfluxClient) Health(ctx context.Context) error {
 
 // WritePriceData writes price data to InfluxDB
 func (ic *InfluxClient) WritePriceData(ctx context.Context, price *models.PriceData) error {
+	// Use exchange from price data, default to "binance" if not set for backward compatibility
+	exchange := price.Exchange
+	if exchange == "" {
+		exchange = "binance"
+	}
+	
 	point := influxdb2.NewPoint(
 		"trades",
 		map[string]string{
-			"exchange": "binance",
+			"exchange": exchange,
 			"symbol":   price.Symbol,
 		},
 		map[string]interface{}{
@@ -100,10 +106,16 @@ func (ic *InfluxClient) WritePriceBatch(ctx context.Context, prices []*models.Pr
 	points := make([]*write.Point, 0, len(prices))
 	
 	for _, price := range prices {
+		// Use exchange from price data, default to "binance" if not set for backward compatibility
+		exchange := price.Exchange
+		if exchange == "" {
+			exchange = "binance"
+		}
+		
 		point := influxdb2.NewPoint(
 			"trades",
 			map[string]string{
-				"exchange": "binance",
+				"exchange": exchange,
 				"symbol":   price.Symbol,
 			},
 			map[string]interface{}{
@@ -514,11 +526,11 @@ func (ic *InfluxClient) GetDataTimeRange(ctx context.Context, symbol string) (ea
 
 // GetATHATL retrieves all-time high and low for a symbol
 func (ic *InfluxClient) GetATHATL(ctx context.Context, symbol string) (ath, atl float64, err error) {
-	// Query for ATH
+	// Query for ATH - check both ohlcv and ohlcv_1d measurements
 	athQuery := fmt.Sprintf(`
 		from(bucket: "%s")
 			|> range(start: -10y)
-			|> filter(fn: (r) => r._measurement == "ohlcv_1d")
+			|> filter(fn: (r) => r._measurement == "ohlcv" or r._measurement == "ohlcv_1d")
 			|> filter(fn: (r) => r.symbol == "%s")
 			|> filter(fn: (r) => r._field == "high")
 			|> max()
@@ -536,11 +548,11 @@ func (ic *InfluxClient) GetATHATL(ctx context.Context, symbol string) (ath, atl 
 	}
 	result.Close()
 	
-	// Query for ATL
+	// Query for ATL - check both ohlcv and ohlcv_1d measurements
 	atlQuery := fmt.Sprintf(`
 		from(bucket: "%s")
 			|> range(start: -10y)
-			|> filter(fn: (r) => r._measurement == "ohlcv_1d")
+			|> filter(fn: (r) => r._measurement == "ohlcv" or r._measurement == "ohlcv_1d")
 			|> filter(fn: (r) => r.symbol == "%s")
 			|> filter(fn: (r) => r._field == "low")
 			|> min()

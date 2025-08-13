@@ -13,6 +13,7 @@ import (
 	"github.com/trade-back/internal/database"
 	"github.com/trade-back/internal/messaging"
 	"github.com/trade-back/internal/services"
+	"github.com/trade-back/pkg/config"
 )
 
 // HistoricalHandler handles historical data API requests
@@ -30,11 +31,12 @@ func NewHistoricalHandler(
 	influx *database.InfluxClient,
 	mysql *database.MySQLClient,
 	nats *messaging.NATSClient,
+	config *config.Config,
 	logger *logrus.Logger,
 ) *HistoricalHandler {
 	return &HistoricalHandler{
-		loader:          services.NewHistoricalLoader(influx, mysql, logger),
-		optimizedLoader: services.NewOptimizedHistoricalLoader(influx, mysql, nats, logger),
+		loader:          services.NewHistoricalLoader(influx, mysql, config, logger),
+		optimizedLoader: services.NewOptimizedHistoricalLoader(influx, mysql, nats, config, logger),
 		influx:          influx,
 		mysql:           mysql,
 		nats:            nats,

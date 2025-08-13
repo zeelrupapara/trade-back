@@ -113,6 +113,7 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 	for rows.Next() {
 		rowCount++
 		symbol := &models.SymbolInfo{}
+		var minPriceIncrement, minQuantityIncrement sql.NullFloat64
 		err := rows.Scan(
 			&symbol.ID,
 			&symbol.Exchange,
@@ -122,8 +123,8 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 			&symbol.BaseCurrency,
 			&symbol.QuoteCurrency,
 			&symbol.IsActive,
-			&symbol.MinPriceIncrement,
-			&symbol.MinQuantityIncrement,
+			&minPriceIncrement,
+			&minQuantityIncrement,
 			&symbol.CreatedAt,
 			&symbol.UpdatedAt,
 		)
@@ -131,6 +132,15 @@ func (mc *MySQLClient) GetSymbols(ctx context.Context) ([]*models.SymbolInfo, er
 			mc.logger.WithError(err).WithField("row", rowCount).Error("Failed to scan symbol")
 			return nil, fmt.Errorf("failed to scan symbol at row %d: %w", rowCount, err)
 		}
+		
+		// Handle NULL values
+		if minPriceIncrement.Valid {
+			symbol.MinPriceIncrement = minPriceIncrement.Float64
+		}
+		if minQuantityIncrement.Valid {
+			symbol.MinQuantityIncrement = minQuantityIncrement.Float64
+		}
+		
 		symbols = append(symbols, symbol)
 		
 	}
@@ -211,6 +221,55 @@ func (mc *MySQLClient) GetSymbol(ctx context.Context, exchange, symbol string) (
 	}
 	
 	return symbolInfo, nil
+}
+
+// SymbolExists checks if a symbol exists in the database
+func (mc *MySQLClient) SymbolExists(ctx context.Context, exchange, symbol string) (bool, error) {
+	query := "SELECT COUNT(*) FROM symbolsmap WHERE exchange = ? AND symbol = ?"
+	
+	var count int
+	err := mc.db.QueryRowContext(ctx, query, exchange, symbol).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	
+	return count > 0, nil
+}
+
+// GetSymbolByName gets a symbol by name from any exchange
+func (mc *MySQLClient) GetSymbolByName(ctx context.Context, symbol string) (*models.SymbolInfo, error) {
+	query := `
+		SELECT id, exchange, symbol, full_name, instrument_type, 
+		       base_currency, quote_currency, is_active,
+		       min_price_increment, min_quantity_increment, 
+		       created_at, updated_at
+		FROM symbolsmap 
+		WHERE symbol = ? AND is_active = 1 
+		ORDER BY CASE WHEN exchange = 'binance' THEN 1 ELSE 2 END
+		LIMIT 1
+	`
+	
+	var symbolInfo models.SymbolInfo
+	err := mc.db.QueryRowContext(ctx, query, symbol).Scan(
+		&symbolInfo.ID,
+		&symbolInfo.Exchange,
+		&symbolInfo.Symbol,
+		&symbolInfo.FullName,
+		&symbolInfo.InstrumentType,
+		&symbolInfo.BaseCurrency,
+		&symbolInfo.QuoteCurrency,
+		&symbolInfo.IsActive,
+		&symbolInfo.MinPriceIncrement,
+		&symbolInfo.MinQuantityIncrement,
+		&symbolInfo.CreatedAt,
+		&symbolInfo.UpdatedAt,
+	)
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	return &symbolInfo, nil
 }
 
 // InsertSymbol inserts a new symbol
@@ -707,5 +766,143 @@ func (mc *MySQLClient) UpdateSyncStatus(ctx context.Context, symbol string, stat
 		mc.logger.WithError(err).Warn("Failed to update market_watch sync status")
 	}
 	
+	return nil
+}
+
+// Asset Extremes operations
+
+// StoreAssetExtreme stores or updates asset extreme values
+func (mc *MySQLClient) StoreAssetExtreme(ctx context.Context, extreme *models.AssetExtreme) error {
+	// Get symbol ID from symbol name
+	var symbolID int
+	err := mc.db.QueryRowContext(ctx, 
+		"SELECT id FROM symbolsmap WHERE symbol = ? LIMIT 1", 
+		extreme.Symbol).Scan(&symbolID)
+	if err != nil {
+		return fmt.Errorf("failed to get symbol ID for %s: %w", extreme.Symbol, err)
+	}
+
+	// Determine exchange (default to binance if not specified)
+	exchange := "binance"
+	if extreme.AssetClass == models.AssetClassForex {
+		exchange = "oanda"
+	}
+
+	query := `
+		INSERT INTO asset_extremes (
+			symbol_id, exchange, ath, atl, ath_date, atl_date,
+			week_52_high, week_52_low, data_source, last_calculated
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+		ON DUPLICATE KEY UPDATE
+			ath = VALUES(ath),
+			atl = VALUES(atl),
+			ath_date = VALUES(ath_date),
+			atl_date = VALUES(atl_date),
+			week_52_high = VALUES(week_52_high),
+			week_52_low = VALUES(week_52_low),
+			data_source = VALUES(data_source),
+			last_calculated = NOW(),
+			updated_at = NOW()
+	`
+
+	// Parse dates
+	var athDate, atlDate *time.Time
+	if extreme.ATHDate != "" {
+		t, err := time.Parse("2006-01-02", extreme.ATHDate)
+		if err == nil {
+			athDate = &t
+		}
+	}
+	if extreme.ATLDate != "" {
+		t, err := time.Parse("2006-01-02", extreme.ATLDate)
+		if err == nil {
+			atlDate = &t
+		}
+	}
+
+	_, err = mc.db.ExecContext(ctx, query,
+		symbolID, exchange, extreme.ATH, extreme.ATL, athDate, atlDate,
+		extreme.Week52High, extreme.Week52Low, extreme.DataSource)
+	
+	if err != nil {
+		return fmt.Errorf("failed to store asset extreme: %w", err)
+	}
+
+	return nil
+}
+
+// GetAssetExtreme retrieves asset extreme values
+func (mc *MySQLClient) GetAssetExtreme(ctx context.Context, symbol string) (*models.AssetExtreme, error) {
+	query := `
+		SELECT 
+			ae.ath, ae.atl, ae.ath_date, ae.atl_date,
+			ae.week_52_high, ae.week_52_low, ae.month_high, ae.month_low,
+			ae.day_high, ae.day_low, ae.data_source, ae.confidence_score,
+			ae.last_calculated, sm.symbol, ae.exchange
+		FROM asset_extremes ae
+		JOIN symbolsmap sm ON ae.symbol_id = sm.id
+		WHERE sm.symbol = ?
+		ORDER BY ae.last_calculated DESC
+		LIMIT 1
+	`
+
+	var extreme models.AssetExtreme
+	var athDate, atlDate sql.NullTime
+	var monthHigh, monthLow, dayHigh, dayLow sql.NullFloat64
+	var confidenceScore sql.NullFloat64
+	var lastCalculated time.Time
+	var exchange string
+
+	err := mc.db.QueryRowContext(ctx, query, symbol).Scan(
+		&extreme.ATH, &extreme.ATL, &athDate, &atlDate,
+		&extreme.Week52High, &extreme.Week52Low, &monthHigh, &monthLow,
+		&dayHigh, &dayLow, &extreme.DataSource, &confidenceScore,
+		&lastCalculated, &extreme.Symbol, &exchange)
+	
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get asset extreme: %w", err)
+	}
+
+	// Set dates
+	if athDate.Valid {
+		extreme.ATHDate = athDate.Time.Format("2006-01-02")
+	}
+	if atlDate.Valid {
+		extreme.ATLDate = atlDate.Time.Format("2006-01-02")
+	}
+
+	// Set asset class based on exchange
+	if exchange == "oanda" {
+		extreme.AssetClass = models.AssetClassForex
+	} else {
+		extreme.AssetClass = models.AssetClassCrypto
+	}
+
+	extreme.LastUpdated = lastCalculated.Unix()
+
+	return &extreme, nil
+}
+
+// UpdateAssetExtremePeriods updates period-based extremes (day, month)
+func (mc *MySQLClient) UpdateAssetExtremePeriods(ctx context.Context, symbolID int, exchange string, 
+	dayHigh, dayLow, monthHigh, monthLow float64) error {
+	
+	query := `
+		UPDATE asset_extremes 
+		SET day_high = ?, day_low = ?, month_high = ?, month_low = ?,
+		    updated_at = NOW()
+		WHERE symbol_id = ? AND exchange = ?
+	`
+
+	_, err := mc.db.ExecContext(ctx, query, 
+		dayHigh, dayLow, monthHigh, monthLow, symbolID, exchange)
+	
+	if err != nil {
+		return fmt.Errorf("failed to update asset extreme periods: %w", err)
+	}
+
 	return nil
 }
