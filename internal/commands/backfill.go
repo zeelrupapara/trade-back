@@ -8,6 +8,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/trade-back/internal/database"
+	"github.com/trade-back/internal/messaging"
 	"github.com/trade-back/internal/services"
 	"github.com/trade-back/pkg/config"
 )
@@ -65,7 +66,7 @@ func init() {
 	backfillCmd.Flags().BoolVar(&backfillAll, "all", false, "Backfill all active symbols")
 	backfillCmd.Flags().BoolVar(&backfillMarketWatch, "marketwatch", false, "Backfill only market watch symbols")
 	backfillCmd.Flags().StringVar(&backfillSession, "session", "", "Session token for market watch (required with --marketwatch)")
-	
+
 	backfillCmd.AddCommand(athAtlCmd)
 	backfillCmd.AddCommand(syncPendingCmd)
 	rootCmd.AddCommand(backfillCmd)
@@ -74,12 +75,12 @@ func init() {
 func runBackfill(cmd *cobra.Command, args []string) error {
 	// Load .env file first
 	config.LoadDotEnv()
-	
+
 	// Validate flags
 	if !backfillAll && !backfillMarketWatch && backfillSymbol == "" {
 		return fmt.Errorf("one of --symbol, --all, or --marketwatch must be specified")
 	}
-	
+
 	// Count how many modes are selected
 	modesSelected := 0
 	if backfillAll {
@@ -91,16 +92,16 @@ func runBackfill(cmd *cobra.Command, args []string) error {
 	if backfillSymbol != "" {
 		modesSelected++
 	}
-	
+
 	if modesSelected > 1 {
 		return fmt.Errorf("only one of --symbol, --all, or --marketwatch can be specified")
 	}
-	
+
 	// Validate marketwatch specific requirements
 	if backfillMarketWatch && backfillSession == "" {
 		return fmt.Errorf("--session is required when using --marketwatch")
 	}
-	
+
 	// Validate interval
 	validIntervals := []string{"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
 	isValid := false
@@ -113,13 +114,13 @@ func runBackfill(cmd *cobra.Command, args []string) error {
 	if !isValid {
 		return fmt.Errorf("invalid interval: %s. Valid intervals: %s", backfillInterval, strings.Join(validIntervals, ", "))
 	}
-	
+
 	// Initialize configuration
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
-	
+
 	// Setup logger
 	logger := logrus.New()
 	logger.SetLevel(logrus.InfoLevel)
@@ -127,29 +128,36 @@ func runBackfill(cmd *cobra.Command, args []string) error {
 		FullTimestamp: true,
 		ForceColors:   true,
 	})
-	
+
+	// nats client init
+	natsClient, err := messaging.NewNATSClient(&cfg.NATS, logger)
+	if err != nil {
+		return fmt.Errorf("failed to create NATS client: %w", err)
+	}
+	defer natsClient.Close()
+
 	// Initialize database clients
 	mysqlClient, err := database.NewMySQLClient(&cfg.Database.MySQL, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create MySQL client: %w", err)
 	}
 	defer mysqlClient.Close()
-	
+
 	influxClient := database.NewInfluxClient(&cfg.Database.Influx, logger)
 	defer influxClient.Close()
-	
+
 	// Create optimized historical loader (nil NATS for backfill - no real-time updates needed)
-	loader := services.NewOptimizedHistoricalLoader(influxClient, mysqlClient, nil, logger)
-	
+	loader := services.NewOptimizedHistoricalLoader(influxClient, mysqlClient, natsClient, cfg, logger)
+
 	ctx := context.Background()
-	
+
 	// Execute backfill
 	if backfillAll {
 		// logger.WithFields(logrus.Fields{
 		// 	"interval": backfillInterval,
 		// 	"days":     backfillDays,
 		// }).Info("Starting backfill for all symbols")
-		
+
 		if err := loader.LoadAllSymbolsParallel(ctx, backfillInterval, backfillDays); err != nil {
 			return fmt.Errorf("backfill failed: %w", err)
 		}
@@ -159,20 +167,20 @@ func runBackfill(cmd *cobra.Command, args []string) error {
 		// 	"days":     backfillDays,
 		// 	"session":  backfillSession,
 		// }).Info("Starting market watch backfill")
-		
+
 		// Get market watch symbols for the session
 		symbols, err := mysqlClient.GetMarketWatchSymbols(ctx, backfillSession)
 		if err != nil {
 			return fmt.Errorf("failed to get market watch symbols: %w", err)
 		}
-		
+
 		if len(symbols) == 0 {
 			logger.Warn("No symbols found in market watch for this session")
 			return nil
 		}
-		
+
 		// logger.WithField("count", len(symbols)).Info("Found market watch symbols")
-		
+
 		// Load historical data for market watch symbols in parallel
 		if err := loader.LoadMarketWatchSymbolsParallel(ctx, backfillSession, backfillInterval, backfillDays); err != nil {
 			return fmt.Errorf("market watch backfill failed: %w", err)
@@ -183,14 +191,14 @@ func runBackfill(cmd *cobra.Command, args []string) error {
 		// 	"interval": backfillInterval,
 		// 	"days":     backfillDays,
 		// }).Info("Starting single symbol backfill")
-		
+
 		if err := loader.LoadHistoricalDataIncremental(ctx, backfillSymbol, backfillInterval, backfillDays); err != nil {
 			return fmt.Errorf("backfill failed: %w", err)
 		}
 	}
-	
+
 	// logger.Info("Backfill completed successfully!")
-	
+
 	// Show summary
 	if backfillAll {
 		symbols, _ := mysqlClient.GetSymbols(ctx)
@@ -225,20 +233,20 @@ func runBackfill(cmd *cobra.Command, args []string) error {
 		// 	"dataPoints": dataPoints,
 		// }).Info("Backfill summary")
 	}
-	
+
 	return nil
 }
 
 func runATHATL(cmd *cobra.Command, args []string) error {
 	// Load .env file first
 	config.LoadDotEnv()
-	
+
 	// Initialize configuration
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
-	
+
 	// Setup logger
 	logger := logrus.New()
 	logger.SetLevel(logrus.InfoLevel)
@@ -246,44 +254,51 @@ func runATHATL(cmd *cobra.Command, args []string) error {
 		FullTimestamp: true,
 		ForceColors:   true,
 	})
-	
+
 	// Initialize database clients
 	mysqlClient, err := database.NewMySQLClient(&cfg.Database.MySQL, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create MySQL client: %w", err)
 	}
 	defer mysqlClient.Close()
-	
+
 	influxClient := database.NewInfluxClient(&cfg.Database.Influx, logger)
 	defer influxClient.Close()
-	
+
+	// Init the nats client
+	natsClient, err := messaging.NewNATSClient(&cfg.NATS, logger)
+	if natsClient != nil {
+		defer natsClient.Close()
+		logger.Info("NATS client error", err)
+	}
+
 	// Create optimized historical loader (nil NATS for backfill - no real-time updates needed)
-	loader := services.NewOptimizedHistoricalLoader(influxClient, mysqlClient, nil, logger)
-	
+	loader := services.NewOptimizedHistoricalLoader(influxClient, mysqlClient, natsClient, cfg, logger)
+
 	ctx := context.Background()
-	
+
 	// logger.Info("Calculating ATH/ATL for all symbols...")
-	
+
 	// Load ATH/ATL (this will also load 2 years of daily data if needed)
 	if err := loader.LoadATHATL(ctx); err != nil {
 		return fmt.Errorf("failed to load ATH/ATL: %w", err)
 	}
-	
+
 	// logger.Info("ATH/ATL calculation completed!")
-	
+
 	// Show results
 	symbols, _ := mysqlClient.GetSymbols(ctx)
 	for _, sym := range symbols {
 		if !sym.IsActive {
 			continue
 		}
-		
+
 		ath, atl, err := influxClient.GetATHATL(ctx, sym.Symbol)
 		if err != nil {
 			logger.WithError(err).WithField("symbol", sym.Symbol).Warn("Failed to get ATH/ATL")
 			continue
 		}
-		
+
 		if ath > 0 && atl > 0 {
 			// logger.WithFields(logrus.Fields{
 			// 	"symbol": sym.Symbol,
@@ -293,14 +308,14 @@ func runATHATL(cmd *cobra.Command, args []string) error {
 			// }).Info("Symbol ATH/ATL")
 		}
 	}
-	
+
 	return nil
 }
 
 func calculateDataPoints(interval string, days int) int {
 	minutesPerDay := 24 * 60
 	totalMinutes := days * minutesPerDay
-	
+
 	intervalMinutes := map[string]int{
 		"1m":  1,
 		"3m":  3,
@@ -318,24 +333,24 @@ func calculateDataPoints(interval string, days int) int {
 		"1w":  10080,
 		"1M":  43200, // Approximate
 	}
-	
+
 	if mins, ok := intervalMinutes[interval]; ok {
 		return totalMinutes / mins
 	}
-	
+
 	return 0
 }
 
 func runSyncPending(cmd *cobra.Command, args []string) error {
 	// Load .env file first
 	config.LoadDotEnv()
-	
+
 	// Initialize configuration
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
-	
+
 	// Setup logger
 	logger := logrus.New()
 	logger.SetLevel(logrus.InfoLevel)
@@ -343,54 +358,60 @@ func runSyncPending(cmd *cobra.Command, args []string) error {
 		FullTimestamp: true,
 		ForceColors:   true,
 	})
-	
+
 	// Initialize database clients
 	mysqlClient, err := database.NewMySQLClient(&cfg.Database.MySQL, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create MySQL client: %w", err)
 	}
 	defer mysqlClient.Close()
-	
+
 	influxClient := database.NewInfluxClient(&cfg.Database.Influx, logger)
 	defer influxClient.Close()
-	
-	// Create optimized historical loader
-	loader := services.NewOptimizedHistoricalLoader(influxClient, mysqlClient, nil, logger)
-	
+
+	natsClient, err := messaging.NewNATSClient(&cfg.NATS, logger)
+	if natsClient != nil {
+		defer natsClient.Close()
+		logger.Info("NATS client error", err)
+	}
+
+	// Create optimized historical loader (nil NATS for backfill - no real-time updates needed)
+	loader := services.NewOptimizedHistoricalLoader(influxClient, mysqlClient, natsClient, cfg, logger)
+
 	ctx := context.Background()
-	
+
 	// Get all pending sync symbols
 	pendingSymbols, err := mysqlClient.GetPendingSyncSymbols(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get pending sync symbols: %w", err)
 	}
-	
+
 	if len(pendingSymbols) == 0 {
 		// logger.Info("No pending symbols to sync")
 		return nil
 	}
-	
+
 	// logger.WithField("count", len(pendingSymbols)).Info("Found pending symbols to sync")
-	
+
 	// Process each symbol
 	successCount := 0
 	failedCount := 0
-	
+
 	for _, item := range pendingSymbols {
 		symbol := item["symbol"].(string)
 		// sessionToken := item["session_token"].(string) // Not needed with new UpdateSyncStatus signature
-		
+
 		// logger.WithFields(logrus.Fields{
 		// 	"symbol": symbol,
 		// 	"status": item["sync_status"],
 		// }).Info("Syncing symbol")
-		
+
 		// Update status to syncing
 		if err := mysqlClient.UpdateSyncStatus(ctx, symbol, "syncing", 0, 0, ""); err != nil {
 			logger.WithError(err).WithField("symbol", symbol).Error("Failed to update sync status")
 			continue
 		}
-		
+
 		// Load historical data (1000 days of 1m data)
 		err := loader.LoadHistoricalDataIncremental(ctx, symbol, "1m", 1000)
 		if err != nil {
@@ -399,21 +420,21 @@ func runSyncPending(cmd *cobra.Command, args []string) error {
 			failedCount++
 			continue
 		}
-		
+
 		// Mark as completed
 		if err := mysqlClient.UpdateSyncStatus(ctx, symbol, "completed", 100, 1000*1440, ""); err != nil {
 			logger.WithError(err).WithField("symbol", symbol).Error("Failed to update sync completion")
 		}
-		
+
 		successCount++
 		// logger.WithField("symbol", symbol).Info("Symbol sync completed")
 	}
-	
+
 	// logger.WithFields(logrus.Fields{
 	// 	"total":   len(pendingSymbols),
 	// 	"success": successCount,
 	// 	"failed":  failedCount,
 	// }).Info("Sync pending completed")
-	
+
 	return nil
 }

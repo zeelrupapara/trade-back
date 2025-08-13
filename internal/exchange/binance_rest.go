@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/trade-back/pkg/models"
 )
 
 // HistoricalKline represents a candlestick/kline data point from REST API
@@ -210,6 +211,69 @@ func (b *BinanceRESTClient) GetSymbolPrice(ctx context.Context, symbol string) (
 	}
 
 	return price, nil
+}
+
+// GetExchangeInfo fetches exchange information including all available symbols
+func (b *BinanceRESTClient) GetExchangeInfo(ctx context.Context) (*BinanceExchangeInfo, error) {
+	b.enforceRateLimit()
+
+	endpoint := fmt.Sprintf("%s/api/v3/exchangeInfo", b.baseURL)
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error: status=%d, body=%s", resp.StatusCode, string(body))
+	}
+
+	var exchangeInfo BinanceExchangeInfo
+	if err := json.NewDecoder(resp.Body).Decode(&exchangeInfo); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	b.logger.WithField("symbols", len(exchangeInfo.Symbols)).Debug("Fetched exchange info successfully")
+	
+	return &exchangeInfo, nil
+}
+
+// ConvertToTradeBackSymbols converts Binance symbol info to trade-back SymbolInfo format
+func (b *BinanceRESTClient) ConvertToTradeBackSymbols(exchangeInfo *BinanceExchangeInfo) []models.SymbolInfo {
+	symbols := make([]models.SymbolInfo, 0, len(exchangeInfo.Symbols))
+	
+	for _, binanceSymbol := range exchangeInfo.Symbols {
+		// Only include active trading symbols that support spot trading
+		if binanceSymbol.Status != "TRADING" || !binanceSymbol.IsSpotTradingAllowed {
+			continue
+		}
+		
+		symbol := models.SymbolInfo{
+			Exchange:       "binance",
+			Symbol:         binanceSymbol.Symbol,
+			FullName:       fmt.Sprintf("%s/%s", binanceSymbol.BaseAsset, binanceSymbol.QuoteAsset),
+			InstrumentType: "SPOT",
+			BaseCurrency:   binanceSymbol.BaseAsset,
+			QuoteCurrency:  binanceSymbol.QuoteAsset,
+			IsActive:       true,
+		}
+		
+		symbols = append(symbols, symbol)
+	}
+	
+	b.logger.WithFields(logrus.Fields{
+		"total_symbols":    len(exchangeInfo.Symbols),
+		"filtered_symbols": len(symbols),
+	}).Debug("Converted Binance symbols to trade-back format")
+	
+	return symbols
 }
 
 // enforceRateLimit ensures we don't exceed API rate limits

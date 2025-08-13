@@ -57,7 +57,7 @@ func NewBinanceClient(id string, symbols []string, config *config.ExchangeConfig
 		config:       config,
 		stopChannels: make([]chan struct{}, 0),
 		lastReset:    time.Now(),
-		highFreqMode: true, // Enable high-frequency mode by default
+		highFreqMode: false, // Disable high-frequency mode to use ticker stream
 	}
 }
 
@@ -149,6 +149,11 @@ func (bc *BinanceClient) ConnectHighFreq(ctx context.Context) error {
 // createTickerHandler creates the ticker event handler
 func (bc *BinanceClient) createTickerHandler() binance.WsMarketTickersStatHandler {
 	return func(event *binance.WsMarketTickerStatEvent) {
+		bc.messageCount.Add(1)
+		
+		// Debug first few messages
+		// Removed debug logging for first few messages
+		
 		// Convert Binance event to our price data format
 		priceData := bc.convertEventToPriceData(event)
 		if priceData == nil {
@@ -157,10 +162,8 @@ func (bc *BinanceClient) createTickerHandler() binance.WsMarketTickersStatHandle
 		
 		// Call registered handlers
 		bc.mu.RLock()
-		for pattern, handler := range bc.handlers {
-			if pattern == "all" || pattern == event.Symbol {
-				handler(priceData)
-			}
+		for _, handler := range bc.handlers {
+			handler(priceData)
 		}
 		bc.mu.RUnlock()
 	}
@@ -233,6 +236,7 @@ func (bc *BinanceClient) convertEventToPriceData(event *binance.WsMarketTickerSt
 	
 	priceData := &models.PriceData{
 		Symbol:        event.Symbol,
+		Exchange:      "binance",
 		Price:         price,
 		Bid:           bid,
 		Ask:           ask,
@@ -247,15 +251,7 @@ func (bc *BinanceClient) convertEventToPriceData(event *binance.WsMarketTickerSt
 	}
 	
 	// DEBUG: Log 24hr change data
-	if changePercent != 0 {
-		bc.logger.WithFields(map[string]interface{}{
-			"symbol": event.Symbol,
-			"changePercent": changePercent,
-			"change24h": change24h,
-			"price": price,
-			"open24h": open24h,
-		}).Info("24hr change data from Binance")
-	}
+	// Removed verbose 24hr change logging to reduce log noise
 	
 	return priceData
 }
@@ -267,15 +263,39 @@ func (bc *BinanceClient) RegisterHandler(pattern string, handler MessageHandler)
 	bc.handlers[pattern] = handler
 }
 
+// SetPriceHandler implements ExchangeClient interface
+func (bc *BinanceClient) SetPriceHandler(id string, handler MessageHandler) {
+	bc.RegisterHandler(id, handler)
+}
+
+// RemovePriceHandler implements ExchangeClient interface
+func (bc *BinanceClient) RemovePriceHandler(id string) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	delete(bc.handlers, id)
+}
+
+// Disconnect implements ExchangeClient interface
+func (bc *BinanceClient) Disconnect() {
+	bc.Close()
+}
+
+// GetSymbols implements ExchangeClient interface
+func (bc *BinanceClient) GetSymbols() []string {
+	return bc.symbols
+}
+
+// GetMessageCount implements ExchangeClient interface
+func (bc *BinanceClient) GetMessageCount() int64 {
+	return bc.messageCount.Load()
+}
+
 // IsConnected returns the connection status
 func (bc *BinanceClient) IsConnected() bool {
 	return bc.connected.Load()
 }
 
 // GetSymbols returns the list of symbols this client handles
-func (bc *BinanceClient) GetSymbols() []string {
-	return bc.symbols
-}
 
 // monitorConnection monitors the connection and handles cleanup
 func (bc *BinanceClient) monitorConnection(ctx context.Context, doneCh chan struct{}) {
@@ -309,6 +329,7 @@ func (bc *BinanceClient) startTradeStream(ctx context.Context) error {
 		
 		priceData := &models.PriceData{
 			Symbol:    event.Data.Symbol,
+			Exchange:  "binance",
 			Price:     price,
 			Volume:    quantity,
 			Timestamp: time.Unix(event.Data.Time/1000, (event.Data.Time%1000)*1e6),
@@ -358,6 +379,7 @@ func (bc *BinanceClient) startAggTradeStream(ctx context.Context) error {
 		
 		priceData := &models.PriceData{
 			Symbol:    event.Symbol,
+			Exchange:  "binance",
 			Price:     price,
 			Volume:    quantity,
 			Timestamp: time.Unix(event.Time/1000, (event.Time%1000)*1e6),
@@ -404,6 +426,7 @@ func (bc *BinanceClient) startBookTickerStream(ctx context.Context) error {
 		
 		priceData := &models.PriceData{
 			Symbol:    event.Symbol,
+			Exchange:  "binance",
 			Price:     (bid + ask) / 2, // Mid price
 			Bid:       bid,
 			Ask:       ask,

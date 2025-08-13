@@ -48,6 +48,7 @@ type App struct {
 	apiServer        *api.Server
 	historicalLoader *services.OptimizedHistoricalLoader
 	instantEnigma    *services.InstantEnigmaService
+	symbolLoader     *services.SymbolLoader
 	coingecko        *external.CoinGeckoClient
 	alphaVantage     *external.AlphaVantageClient
 	extremeTracker   *services.UnifiedExtremeTracker
@@ -335,6 +336,9 @@ func (a *App) initializeExchange() error {
 		return fmt.Errorf("failed to initialize hub: %w", err)
 	}
 	
+	// Create CoinGecko client (empty API key for free tier)
+	a.coingecko = external.NewCoinGeckoClient("", a.logger)
+	
 	// Create Alpha Vantage client for forex/stocks
 	alphaVantageKey := "demo" // Use demo key, can be configured later
 	a.alphaVantage = external.NewAlphaVantageClient(alphaVantageKey, a.logger)
@@ -348,6 +352,16 @@ func (a *App) initializeExchange() error {
 		a.redisCache,
 		a.logger,
 	)
+	
+	// Add OANDA historical provider for forex extremes if OANDA is configured
+	if a.cfg.Exchange.OANDA.APIKey != "" {
+		oandaHistorical := exchange.NewOANDAHistoricalExtremes(
+			a.cfg.Exchange.OANDA.APIKey,
+			a.cfg.Exchange.OANDA.AccountID,
+			a.logger,
+		)
+		a.extremeTracker.SetOandaHistoricalProvider(oandaHistorical)
+	}
 	
 	// Create services
 	a.enigmaCalc = enigma.NewCalculator(
@@ -385,16 +399,22 @@ func (a *App) initializeWebSocket() error {
 
 func (a *App) initializeAPIServer() error {
 	
+	// Create symbol loader
+	a.symbolLoader = services.NewSymbolLoader(a.mysqlDB, a.cfg, a.logger)
+	
+	// Load symbols from all exchanges on startup
+	if err := a.symbolLoader.LoadSymbolsOnStartup(context.Background()); err != nil {
+		a.logger.WithError(err).Warn("Failed to load symbols on startup")
+	}
+	
 	// Create historical loader
 	a.historicalLoader = services.NewOptimizedHistoricalLoader(
 		a.influxDB,
 		a.mysqlDB,
 		a.natsClient,
+		a.cfg,
 		a.logger,
 	)
-	
-	// Create CoinGecko client (empty API key for free tier)
-	a.coingecko = external.NewCoinGeckoClient("", a.logger)
 	
 	// Create instant Enigma service
 	a.instantEnigma = services.NewInstantEnigmaService(

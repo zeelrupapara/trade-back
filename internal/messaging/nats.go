@@ -19,10 +19,10 @@ type NATSClient struct {
 	encoder *nats.EncodedConn
 	logger  *logrus.Entry
 	cfg     *config.NATSConfig
-	
+
 	// Subscriptions
-	subs    map[string]*nats.Subscription
-	subsMu  sync.RWMutex
+	subs   map[string]*nats.Subscription
+	subsMu sync.RWMutex
 }
 
 // NewNATSClient creates a new NATS client
@@ -34,32 +34,32 @@ func NewNATSClient(cfg *config.NATSConfig, logger *logrus.Logger) (*NATSClient, 
 			logger.WithError(err).Warn("NATS disconnected")
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			// logger.Info("NATS reconnected")
+			logger.Info("NATS reconnected")
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			// logger.Info("NATS connection closed")
+			logger.Info("NATS connection closed")
 		}),
 	}
-	
+
 	conn, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
-	
+
 	// Create JetStream context
 	js, err := conn.JetStream()
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
-	
+
 	// Create encoded connection for JSON
 	encoder, err := nats.NewEncodedConn(conn, nats.JSON_ENCODER)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create encoded connection: %w", err)
 	}
-	
+
 	nc := &NATSClient{
 		conn:    conn,
 		js:      js,
@@ -68,13 +68,13 @@ func NewNATSClient(cfg *config.NATSConfig, logger *logrus.Logger) (*NATSClient, 
 		cfg:     cfg,
 		subs:    make(map[string]*nats.Subscription),
 	}
-	
+
 	// Initialize streams
 	if err := nc.initializeStreams(); err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("failed to initialize streams: %w", err)
 	}
-	
+
 	return nc, nil
 }
 
@@ -86,7 +86,7 @@ func (nc *NATSClient) Close() error {
 	}
 	nc.subs = make(map[string]*nats.Subscription)
 	nc.subsMu.Unlock()
-	
+
 	nc.encoder.Close()
 	nc.conn.Close()
 	return nil
@@ -111,7 +111,7 @@ func (nc *NATSClient) initializeStreams() error {
 	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
 		return fmt.Errorf("failed to create PRICES stream: %w", err)
 	}
-	
+
 	// Enigma stream for technical indicators
 	_, err = nc.js.AddStream(&nats.StreamConfig{
 		Name:     "ENIGMA",
@@ -124,7 +124,7 @@ func (nc *NATSClient) initializeStreams() error {
 	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
 		return fmt.Errorf("failed to create ENIGMA stream: %w", err)
 	}
-	
+
 	// Sessions stream for trading session events
 	_, err = nc.js.AddStream(&nats.StreamConfig{
 		Name:     "SESSIONS",
@@ -137,7 +137,7 @@ func (nc *NATSClient) initializeStreams() error {
 	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
 		return fmt.Errorf("failed to create SESSIONS stream: %w", err)
 	}
-	
+
 	// System stream for health and monitoring
 	_, err = nc.js.AddStream(&nats.StreamConfig{
 		Name:     "SYSTEM",
@@ -150,7 +150,7 @@ func (nc *NATSClient) initializeStreams() error {
 	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
 		return fmt.Errorf("failed to create SYSTEM stream: %w", err)
 	}
-	
+
 	// Sync stream for historical data sync progress
 	_, err = nc.js.AddStream(&nats.StreamConfig{
 		Name:     "SYNC",
@@ -163,7 +163,7 @@ func (nc *NATSClient) initializeStreams() error {
 	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
 		return fmt.Errorf("failed to create SYNC stream: %w", err)
 	}
-	
+
 	// nc.logger.Info("JetStream streams initialized")
 	return nil
 }
@@ -176,13 +176,13 @@ func (nc *NATSClient) PublishPrice(subject string, price *models.PriceData) erro
 	if err != nil {
 		return fmt.Errorf("failed to marshal price: %w", err)
 	}
-	
+
 	// Use PublishAsync for non-blocking publish with timeout
 	future, err := nc.js.PublishAsync(subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish price: %w", err)
 	}
-	
+
 	// Wait for acknowledgment with timeout
 	select {
 	case <-future.Ok():
@@ -218,14 +218,14 @@ func (nc *NATSClient) SubscribePrices(handler func(*models.PriceData), symbols .
 			if err != nil {
 				return fmt.Errorf("failed to subscribe to %s: %w", subj, err)
 			}
-			
+
 			nc.subsMu.Lock()
 			nc.subs[subj] = sub
 			nc.subsMu.Unlock()
 		}
 		return nil
 	}
-	
+
 	// Subscribe to all prices
 	sub, err := nc.encoder.Subscribe(subject, func(price *models.PriceData) {
 		handler(price)
@@ -233,11 +233,11 @@ func (nc *NATSClient) SubscribePrices(handler func(*models.PriceData), symbols .
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to prices: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }
 
@@ -270,14 +270,14 @@ func (nc *NATSClient) SubscribeEnigma(handler func(*models.EnigmaData), symbols 
 			if err != nil {
 				return fmt.Errorf("failed to subscribe to %s: %w", subj, err)
 			}
-			
+
 			nc.subsMu.Lock()
 			nc.subs[subj] = sub
 			nc.subsMu.Unlock()
 		}
 		return nil
 	}
-	
+
 	// Subscribe to all enigma updates
 	sub, err := nc.encoder.Subscribe(subject, func(enigma *models.EnigmaData) {
 		handler(enigma)
@@ -285,11 +285,11 @@ func (nc *NATSClient) SubscribeEnigma(handler func(*models.EnigmaData), symbols 
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to enigma: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }
 
@@ -312,18 +312,18 @@ func (nc *NATSClient) PublishSessionChange(event *models.SessionChangeEvent) err
 // SubscribeSessions subscribes to session events
 func (nc *NATSClient) SubscribeSessions(handler func(*models.SessionChangeEvent)) error {
 	subject := "sessions.>"
-	
+
 	sub, err := nc.encoder.Subscribe(subject, func(event *models.SessionChangeEvent) {
 		handler(event)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to sessions: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }
 
@@ -346,13 +346,13 @@ func (nc *NATSClient) PublishHealthStatus(status *models.HealthStatus) error {
 // PublishError publishes system error
 func (nc *NATSClient) PublishError(err error, context map[string]interface{}) error {
 	subject := "system.errors"
-	
+
 	errorData := map[string]interface{}{
 		"error":     err.Error(),
 		"context":   context,
 		"timestamp": time.Now().Unix(),
 	}
-	
+
 	data, marshalErr := json.Marshal(errorData)
 	if marshalErr != nil {
 		return fmt.Errorf("failed to marshal error data: %w", marshalErr)
@@ -369,47 +369,47 @@ func (nc *NATSClient) PublishError(err error, context map[string]interface{}) er
 // RequestPrice requests current price for a symbol
 func (nc *NATSClient) RequestPrice(symbol string, timeout time.Duration) (*models.PriceData, error) {
 	subject := fmt.Sprintf("request.price.%s", symbol)
-	
+
 	var price models.PriceData
 	err := nc.encoder.Request(subject, nil, &price, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to request price: %w", err)
 	}
-	
+
 	return &price, nil
 }
 
 // RespondToRequests sets up responder for price requests
 func (nc *NATSClient) RespondToRequests(getPriceFunc func(string) (*models.PriceData, error)) error {
 	subject := "request.price.*"
-	
+
 	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
 		// Extract symbol from subject
 		symbol := msg.Subject[len("request.price."):]
-		
+
 		price, err := getPriceFunc(symbol)
 		if err != nil {
 			nc.logger.WithError(err).WithField("symbol", symbol).Error("Failed to get price for request")
 			return
 		}
-		
+
 		data, err := json.Marshal(price)
 		if err != nil {
 			nc.logger.WithError(err).Error("Failed to marshal price response")
 			return
 		}
-		
+
 		msg.Respond(data)
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to requests: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }
 
@@ -423,11 +423,11 @@ func (nc *NATSClient) SubscribeQueue(subject, queue string, handler func([]byte)
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to queue: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject+":"+queue] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }
 
@@ -435,14 +435,14 @@ func (nc *NATSClient) SubscribeQueue(subject, queue string, handler func([]byte)
 func (nc *NATSClient) Unsubscribe(subject string) error {
 	nc.subsMu.Lock()
 	defer nc.subsMu.Unlock()
-	
+
 	if sub, exists := nc.subs[subject]; exists {
 		if err := sub.Unsubscribe(); err != nil {
 			return fmt.Errorf("failed to unsubscribe: %w", err)
 		}
 		delete(nc.subs, subject)
 	}
-	
+
 	return nil
 }
 
@@ -475,15 +475,15 @@ func (nc *NATSClient) PublishSyncProgress(symbol string, progress int, totalBars
 	if err != nil {
 		return fmt.Errorf("failed to marshal sync progress: %w", err)
 	}
-	
+
 	// Log for debugging
 	nc.logger.WithFields(logrus.Fields{
-		"subject": subject,
-		"symbol": symbol,
-		"progress": progress,
+		"subject":   subject,
+		"symbol":    symbol,
+		"progress":  progress,
 		"totalBars": totalBars,
 	}).Debug("Publishing sync progress to NATS")
-	
+
 	_, err = nc.js.Publish(subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish sync progress: %w", err)
@@ -504,7 +504,7 @@ func (nc *NATSClient) PublishSyncComplete(symbol string, totalBars int, startTim
 	if err != nil {
 		return fmt.Errorf("failed to marshal sync complete: %w", err)
 	}
-	
+
 	_, err = nc.js.Publish(subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish sync complete: %w", err)
@@ -515,67 +515,67 @@ func (nc *NATSClient) PublishSyncComplete(symbol string, totalBars int, startTim
 // SubscribeSyncUpdates subscribes to sync progress updates
 func (nc *NATSClient) SubscribeSyncUpdates(handler func(string, int, int)) error {
 	subject := "sync.progress.*"
-	
+
 	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
 		var data map[string]interface{}
 		if err := json.Unmarshal(msg.Data, &data); err != nil {
 			nc.logger.WithError(err).Error("Failed to unmarshal sync progress")
 			return
 		}
-		
+
 		symbol, _ := data["symbol"].(string)
 		progress := int(data["progress"].(float64))
 		totalBars := int(data["totalBars"].(float64))
-		
+
 		// Log for debugging
 		nc.logger.WithFields(logrus.Fields{
-			"subject": msg.Subject,
-			"symbol": symbol,
-			"progress": progress,
+			"subject":   msg.Subject,
+			"symbol":    symbol,
+			"progress":  progress,
 			"totalBars": totalBars,
 		}).Debug("Received sync progress from NATS")
-		
+
 		handler(symbol, progress, totalBars)
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to sync updates: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }
 
 // SubscribeSyncComplete subscribes to sync completion notifications
 func (nc *NATSClient) SubscribeSyncComplete(handler func(string, int, time.Time, time.Time)) error {
 	subject := "sync.complete.*"
-	
+
 	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
 		var data map[string]interface{}
 		if err := json.Unmarshal(msg.Data, &data); err != nil {
 			nc.logger.WithError(err).Error("Failed to unmarshal sync complete")
 			return
 		}
-		
+
 		symbol, _ := data["symbol"].(string)
 		totalBars := int(data["totalBars"].(float64))
 		startTime, _ := time.Parse(time.RFC3339, data["startTime"].(string))
 		endTime, _ := time.Parse(time.RFC3339, data["endTime"].(string))
-		
+
 		handler(symbol, totalBars, startTime, endTime)
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to sync complete: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }
 
@@ -590,7 +590,7 @@ func (nc *NATSClient) PublishSyncError(symbol string, errorMsg string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal sync error: %w", err)
 	}
-	
+
 	_, err = nc.js.Publish(subject, data)
 	if err != nil {
 		return fmt.Errorf("failed to publish sync error: %w", err)
@@ -601,27 +601,27 @@ func (nc *NATSClient) PublishSyncError(symbol string, errorMsg string) error {
 // SubscribeSyncErrors subscribes to sync error notifications
 func (nc *NATSClient) SubscribeSyncErrors(handler func(string, string)) error {
 	subject := "sync.error.*"
-	
+
 	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
 		var data map[string]interface{}
 		if err := json.Unmarshal(msg.Data, &data); err != nil {
 			nc.logger.WithError(err).Error("Failed to unmarshal sync error")
 			return
 		}
-		
+
 		symbol, _ := data["symbol"].(string)
 		errorMsg, _ := data["error"].(string)
-		
+
 		handler(symbol, errorMsg)
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to sync errors: %w", err)
 	}
-	
+
 	nc.subsMu.Lock()
 	nc.subs[subject] = sub
 	nc.subsMu.Unlock()
-	
+
 	return nil
 }

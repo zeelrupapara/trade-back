@@ -23,7 +23,7 @@ type Config struct {
 	Webhook     WebhookConfig     `env:", prefix=WEBHOOK_"`
 	Logging     LoggingConfig     `env:", prefix=LOG_"`
 	Monitoring  MonitoringConfig  `env:", prefix=MONITORING_"`
-	
+
 	// Maintain backward compatibility
 	Database  DatabaseConfig
 	Cache     CacheConfig
@@ -66,7 +66,7 @@ type MySQLConfig struct {
 	MaxOpenConns    int           `env:"MAX_OPEN_CONNS, default=25"`
 	MaxIdleConns    int           `env:"MAX_IDLE_CONNS, default=5"`
 	ConnMaxLifetime time.Duration `env:"CONN_MAX_LIFETIME, default=5m"`
-	
+
 	// Backward compatibility
 	Username string
 }
@@ -108,15 +108,30 @@ type ExchangeConfig struct {
 	MaxReconnectAttempts    int           `env:"MAX_RECONNECT_ATTEMPTS, default=10"`
 	ConnectionTimeout       time.Duration `env:"CONNECTION_TIMEOUT, default=30s"`
 	PingInterval            time.Duration `env:"PING_INTERVAL, default=30s"`
-	
-	// Binance is handled separately
+
+	// Exchange-specific configurations
 	Binance BinanceConfig
+	OANDA   OANDAConfig
 }
 
 // BinanceConfig holds Binance-specific configuration
 type BinanceConfig struct {
+	APIKey    string `env:"BINANCE_API_KEY"`
+	SecretKey string `env:"BINANCE_SECRET_KEY"`
 	StreamURL string `env:"BINANCE_STREAM_URL, default=wss://stream.binance.com:9443/stream"`
 	APIURL    string `env:"BINANCE_API_URL, default=https://api.binance.com"`
+}
+
+// OANDAConfig holds OANDA-specific configuration
+type OANDAConfig struct {
+	APIKey         string        `env:"OANDA_API_KEY"`
+	AccountID      string        `env:"OANDA_ACCOUNT_ID"`
+	Environment    string        `env:"OANDA_ENVIRONMENT, default=practice"` // live or practice
+	APIURL         string        `env:"OANDA_API_URL"`                       // Auto-set based on environment
+	StreamURL      string        `env:"OANDA_STREAM_URL"`                    // Auto-set based on environment
+	MaxInstruments int           `env:"OANDA_MAX_INSTRUMENTS, default=100"`  // Max instruments per stream
+	StreamTimeout  time.Duration `env:"OANDA_STREAM_TIMEOUT, default=30s"`
+	RetryDelay     time.Duration `env:"OANDA_RETRY_DELAY, default=5s"`
 }
 
 // PerformanceConfig holds performance-related configuration
@@ -195,19 +210,44 @@ type WebhookConfig struct {
 func Load() (*Config, error) {
 	ctx := context.Background()
 	var cfg Config
-	
+
 	// Load main config
 	if err := envconfig.Process(ctx, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to process config: %w", err)
 	}
-	
-	// Load Binance config separately due to nested structure
+
+	// Load exchange configs separately due to nested structure
 	var binanceCfg BinanceConfig
 	if err := envconfig.Process(ctx, &binanceCfg); err != nil {
 		return nil, fmt.Errorf("failed to process binance config: %w", err)
 	}
 	cfg.Exchange.Binance = binanceCfg
-	
+
+	// Load OANDA config
+	var oandaCfg OANDAConfig
+	if err := envconfig.Process(ctx, &oandaCfg); err != nil {
+		return nil, fmt.Errorf("failed to process oanda config: %w", err)
+	}
+
+	// Auto-set OANDA URLs based on environment
+	if oandaCfg.Environment == "live" {
+		if oandaCfg.APIURL == "" {
+			oandaCfg.APIURL = "https://api-fxtrade.oanda.com"
+		}
+		if oandaCfg.StreamURL == "" {
+			oandaCfg.StreamURL = "https://stream-fxtrade.oanda.com"
+		}
+	} else {
+		// Default to practice
+		if oandaCfg.APIURL == "" {
+			oandaCfg.APIURL = "https://api-fxpractice.oanda.com"
+		}
+		if oandaCfg.StreamURL == "" {
+			oandaCfg.StreamURL = "https://stream-fxpractice.oanda.com"
+		}
+	}
+	cfg.Exchange.OANDA = oandaCfg
+
 	// Set up backward compatibility structures
 	cfg.Database = DatabaseConfig{
 		MySQL:  cfg.MySQL,
@@ -219,16 +259,16 @@ func Load() (*Config, error) {
 	cfg.Messaging = MessagingConfig{
 		NATS: cfg.NATS,
 	}
-	
+
 	// Update MySQL Username field for backward compatibility
 	cfg.Database.MySQL.Username = cfg.MySQL.User
 	cfg.MySQL.Username = cfg.MySQL.User
-	
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
-	
+
 	return &cfg, nil
 }
 
@@ -242,23 +282,23 @@ func (c *Config) Validate() error {
 	if c.Server.Port <= 0 || c.Server.Port > 65535 {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
 	}
-	
+
 	if c.Database.MySQL.Host == "" {
 		return fmt.Errorf("MySQL host is required")
 	}
-	
+
 	if c.Database.Influx.URL == "" {
 		return fmt.Errorf("InfluxDB URL is required")
 	}
-	
+
 	if c.Cache.Redis.Host == "" {
 		return fmt.Errorf("Redis host is required")
 	}
-	
+
 	if c.Messaging.NATS.URL == "" {
 		return fmt.Errorf("NATS URL is required")
 	}
-	
+
 	return nil
 }
 

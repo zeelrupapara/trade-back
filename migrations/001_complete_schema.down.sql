@@ -3,6 +3,7 @@
 
 -- Drop tables in reverse order of creation to handle foreign key constraints
 DROP TABLE IF EXISTS sync_checkpoint;
+DROP TABLE IF EXISTS asset_extremes;
 DROP TABLE IF EXISTS market_watch;
 DROP TABLE IF EXISTS sync_status;
 DROP TABLE IF EXISTS system_config;

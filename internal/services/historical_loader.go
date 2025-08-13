@@ -10,15 +10,18 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/trade-back/internal/database"
 	"github.com/trade-back/internal/exchange"
+	"github.com/trade-back/pkg/config"
 	"github.com/trade-back/pkg/models"
 )
 
 // HistoricalLoader loads historical market data
 type HistoricalLoader struct {
 	binanceREST *exchange.BinanceRESTClient
+	oandaREST   *exchange.OANDARESTClient
 	influx      *database.InfluxClient
 	mysql       *database.MySQLClient
 	logger      *logrus.Entry
+	config      *config.Config
 	
 	// Configuration
 	maxConcurrent int
@@ -29,12 +32,20 @@ type HistoricalLoader struct {
 func NewHistoricalLoader(
 	influx *database.InfluxClient,
 	mysql *database.MySQLClient,
+	config *config.Config,
 	logger *logrus.Logger,
 ) *HistoricalLoader {
+	var oandaREST *exchange.OANDARESTClient
+	if config.Exchange.OANDA.APIKey != "" && config.Exchange.OANDA.AccountID != "" {
+		oandaREST = exchange.NewOANDARESTClient(&config.Exchange.OANDA, logger)
+	}
+
 	return &HistoricalLoader{
 		binanceREST:   exchange.NewBinanceRESTClient(logger),
+		oandaREST:     oandaREST,
 		influx:        influx,
 		mysql:         mysql,
+		config:        config,
 		logger:        logger.WithField("component", "historical-loader"),
 		maxConcurrent: 3, // Process 3 symbols concurrently
 		batchDelay:    time.Second, // Delay between batches
@@ -48,17 +59,43 @@ func (h *HistoricalLoader) LoadHistoricalDataWithCheckpoint(ctx context.Context,
 		h.logger.WithError(err).Warn("Failed to update sync status")
 	}
 
-	// Fetch klines from Binance
-	klines, err := h.binanceREST.GetKlinesBatch(
-		ctx,
-		symbol,
-		interval,
-		startTime.UnixMilli(),
-		endTime.UnixMilli(),
-	)
+	// Determine exchange for symbol
+	symbolInfo, err := h.mysql.GetSymbolByName(ctx, symbol)
+	if err != nil {
+		h.mysql.UpdateSyncStatus(ctx, symbol, "failed", 0, 0, "Symbol not found in database")
+		return fmt.Errorf("failed to get symbol info: %w", err)
+	}
+
+	// Fetch klines from appropriate exchange
+	var klines []exchange.HistoricalKline
+	
+	switch symbolInfo.Exchange {
+	case "oanda":
+		if h.oandaREST == nil {
+			h.mysql.UpdateSyncStatus(ctx, symbol, "failed", 0, 0, "OANDA not configured")
+			return fmt.Errorf("OANDA REST client not available")
+		}
+		klines, err = h.oandaREST.GetKlinesBatch(
+			ctx,
+			symbol,
+			interval,
+			startTime.UnixMilli(),
+			endTime.UnixMilli(),
+		)
+		
+	default: // binance or unknown (default to binance)
+		klines, err = h.binanceREST.GetKlinesBatch(
+			ctx,
+			symbol,
+			interval,
+			startTime.UnixMilli(),
+			endTime.UnixMilli(),
+		)
+	}
+	
 	if err != nil {
 		h.mysql.UpdateSyncStatus(ctx, symbol, "failed", 0, 0, err.Error())
-		return fmt.Errorf("failed to fetch klines: %w", err)
+		return fmt.Errorf("failed to fetch klines from %s: %w", symbolInfo.Exchange, err)
 	}
 
 	totalBars := len(klines)
@@ -99,8 +136,27 @@ func (h *HistoricalLoader) LoadHistoricalDataWithCheckpoint(ctx context.Context,
 	return nil
 }
 
+// isForexSymbol checks if a symbol is a forex pair (contains underscore)
+func (h *HistoricalLoader) isForexSymbol(symbol string) bool {
+	// OANDA forex symbols use underscore format like EUR_USD
+	return len(symbol) > 0 && (symbol[3:4] == "_" || (len(symbol) > 4 && symbol[4:5] == "_"))
+}
+
 // LoadHistoricalData loads historical data for a single symbol
 func (h *HistoricalLoader) LoadHistoricalData(ctx context.Context, symbol string, interval string, days int) error {
+	// Skip FOREX symbols from historical sync (they use real-time streaming)
+	if h.isForexSymbol(symbol) {
+		h.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"reason": "FOREX symbols use real-time streaming only",
+		}).Debug("Skipping historical sync for FOREX symbol")
+		
+		// Mark as completed immediately
+		if h.mysql != nil {
+			h.mysql.UpdateSyncStatus(ctx, symbol, "completed", 100, 0, "FOREX - streaming only")
+		}
+		return nil
+	}
 	// h.logger.WithFields(logrus.Fields{
 	// 	"symbol":   symbol,
 	// 	"interval": interval,

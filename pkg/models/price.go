@@ -7,6 +7,7 @@ import (
 // PriceData represents real-time price information
 type PriceData struct {
 	Symbol        string    `json:"symbol"`
+	Exchange      string    `json:"exchange"`        // Exchange name (binance, oanda, etc.)
 	Price         float64   `json:"price"`
 	Bid           float64   `json:"bid"`
 	Ask           float64   `json:"ask"`
