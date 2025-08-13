@@ -164,6 +164,19 @@ func (nc *NATSClient) initializeStreams() error {
 		return fmt.Errorf("failed to create SYNC stream: %w", err)
 	}
 
+	// Levels stream for period level updates (daily/weekly/monthly ATH/ATL)
+	_, err = nc.js.AddStream(&nats.StreamConfig{
+		Name:     "LEVELS",
+		Subjects: []string{"levels.>"},
+		Storage:  nats.MemoryStorage,
+		MaxAge:   24 * time.Hour,
+		MaxMsgs:  50000,
+		Replicas: 1,
+	})
+	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
+		return fmt.Errorf("failed to create LEVELS stream: %w", err)
+	}
+
 	// nc.logger.Info("JetStream streams initialized")
 	return nil
 }
@@ -413,6 +426,22 @@ func (nc *NATSClient) RespondToRequests(getPriceFunc func(string) (*models.Price
 	return nil
 }
 
+// SubscribeRaw subscribes to a raw NATS subject with a simple byte handler
+func (nc *NATSClient) SubscribeRaw(subject string, handler func([]byte)) error {
+	sub, err := nc.conn.Subscribe(subject, func(msg *nats.Msg) {
+		handler(msg.Data)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to subject %s: %w", subject, err)
+	}
+
+	nc.subsMu.Lock()
+	nc.subs[subject] = sub
+	nc.subsMu.Unlock()
+
+	return nil
+}
+
 // Queue groups for load balancing
 
 // SubscribeQueue subscribes with queue group for load balancing
@@ -595,6 +624,21 @@ func (nc *NATSClient) PublishSyncError(symbol string, errorMsg string) error {
 	if err != nil {
 		return fmt.Errorf("failed to publish sync error: %w", err)
 	}
+	return nil
+}
+
+// PublishJSON publishes arbitrary JSON data to a subject
+func (nc *NATSClient) PublishJSON(subject string, data interface{}) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal data: %w", err)
+	}
+	
+	_, err = nc.js.Publish(subject, jsonData)
+	if err != nil {
+		return fmt.Errorf("failed to publish to %s: %w", subject, err)
+	}
+	
 	return nil
 }
 

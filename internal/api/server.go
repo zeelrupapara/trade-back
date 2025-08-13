@@ -44,12 +44,14 @@ type Server struct {
 	instantEnigma    *services.InstantEnigmaService
 	hub              *exchange.Hub
 	extremeTracker   *services.UnifiedExtremeTracker
+	periodExtremes   *services.PeriodExtremesService
 	
 	// API handlers
 	tradingViewAPI    *TradingViewAPI
 	webhookHandler    *WebhookHandler
 	historicalHandler *apiHandlers.HistoricalHandler
 	enigmaHandler     *apiHandlers.EnigmaHandler
+	periodHandler     *apiHandlers.PeriodLevelsHandler
 }
 
 // NewServer creates a new API server
@@ -66,6 +68,7 @@ func NewServer(
 	instantEnigma *services.InstantEnigmaService,
 	hub *exchange.Hub,
 	extremeTracker *services.UnifiedExtremeTracker,
+	periodExtremes *services.PeriodExtremesService,
 ) *Server {
 	s := &Server{
 		cfg:        cfg,
@@ -80,6 +83,7 @@ func NewServer(
 		instantEnigma: instantEnigma,
 		hub: hub,
 		extremeTracker: extremeTracker,
+		periodExtremes: periodExtremes,
 	}
 	
 	if wsManager == nil {
@@ -91,6 +95,7 @@ func NewServer(
 	s.webhookHandler = NewWebhookHandler(natsClient, &cfg.Webhook, logger)
 	s.historicalHandler = apiHandlers.NewHistoricalHandler(influxDB, mysqlDB, natsClient, cfg, logger)
 	s.enigmaHandler = apiHandlers.NewEnigmaHandler(enigmaCalc, extremeTracker, redisCache, logger)
+	s.periodHandler = apiHandlers.NewPeriodLevelsHandler(periodExtremes, redisCache, logger)
 	
 	// Setup routes
 	s.setupRoutes()
@@ -159,6 +164,11 @@ func (s *Server) setupRoutes() {
 	// Enigma endpoints
 	if s.enigmaHandler != nil {
 		s.enigmaHandler.RegisterRoutes(s.router)
+	}
+	
+	// Period levels endpoints
+	if s.periodHandler != nil {
+		s.periodHandler.RegisterRoutes(s.router)
 	}
 }
 

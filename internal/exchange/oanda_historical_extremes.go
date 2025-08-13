@@ -23,10 +23,13 @@ type OANDAHistoricalExtremes struct {
 
 // NewOANDAHistoricalExtremes creates a new OANDA historical extremes fetcher
 func NewOANDAHistoricalExtremes(apiKey, accountID string, logger *logrus.Logger) *OANDAHistoricalExtremes {
+	// Use practice environment for historical data (same API key pattern as streaming)
+	baseURL := "https://api-fxpractice.oanda.com"
+	
 	return &OANDAHistoricalExtremes{
 		apiKey:    apiKey,
 		accountID: accountID,
-		baseURL:   "https://api-fxtrade.oanda.com",
+		baseURL:   baseURL,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},

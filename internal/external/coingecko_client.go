@@ -62,7 +62,7 @@ func NewCoinGeckoClient(apiKey string, logger *logrus.Logger) *CoinGeckoClient {
 
 // rateLimitWorker ensures we don't exceed rate limits (30 calls/min for free tier)
 func (c *CoinGeckoClient) rateLimitWorker() {
-	ticker := time.NewTicker(2 * time.Second) // 30 calls/min = 1 call per 2 seconds
+	ticker := time.NewTicker(3 * time.Second) // Conservative: 20 calls/min to avoid 429 errors
 	defer ticker.Stop()
 	
 	for range ticker.C {
@@ -110,16 +110,12 @@ func (c *CoinGeckoClient) GetATHATL(ctx context.Context, binanceSymbol string) (
 		req.Header.Set("x-cg-demo-api-key", c.apiKey)
 	}
 	
-	// Execute request
-	resp, err := c.httpClient.Do(req)
+	// Execute request with retry logic for 429 errors
+	resp, err := c.executeWithRetry(req)
 	if err != nil {
-		return 0, 0, fmt.Errorf("request failed: %w", err)
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("API returned status %d", resp.StatusCode)
-	}
 	
 	// Parse response
 	var data CoinGeckoMarketData
@@ -222,15 +218,11 @@ func (c *CoinGeckoClient) GetMarketData(ctx context.Context, binanceSymbol strin
 		req.Header.Set("x-cg-demo-api-key", c.apiKey)
 	}
 	
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.executeWithRetry(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
-	}
 	
 	var data CoinGeckoMarketData
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
@@ -247,4 +239,48 @@ func (c *CoinGeckoClient) UpdateSymbolMapping(binanceSymbol, coinGeckoID string)
 	
 	base := strings.TrimSuffix(strings.ToLower(binanceSymbol), "usdt")
 	c.symbolMap[base] = coinGeckoID
+}
+
+// executeWithRetry executes HTTP request with exponential backoff for 429 errors
+func (c *CoinGeckoClient) executeWithRetry(req *http.Request) (*http.Response, error) {
+	maxRetries := 3
+	baseDelay := 5 * time.Second
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+		
+		// Success case
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		
+		// Handle rate limiting
+		if resp.StatusCode == 429 {
+			resp.Body.Close()
+			
+			if attempt == maxRetries {
+				c.logger.Error("Max retries exceeded for CoinGecko API rate limit")
+				return nil, fmt.Errorf("rate limit exceeded, max retries reached")
+			}
+			
+			// Exponential backoff: 5s, 10s, 20s
+			delay := baseDelay * time.Duration(1<<attempt)
+			c.logger.WithFields(logrus.Fields{
+				"attempt": attempt + 1,
+				"delay":   delay,
+			}).Warn("CoinGecko rate limit hit, retrying after delay")
+			
+			time.Sleep(delay)
+			continue
+		}
+		
+		// Other error status codes
+		resp.Body.Close()
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+	
+	return nil, fmt.Errorf("unexpected error in retry logic")
 }

@@ -395,6 +395,83 @@ func (bm *BinaryManager) SendSymbolRemoved(sessionToken, symbol string) {
 	}
 }
 
+// SendPeriodLevelUpdate sends period level updates to all connected clients
+func (bm *BinaryManager) SendPeriodLevelUpdate(update *models.PeriodLevelUpdate) {
+	// Create WebSocket message
+	message := map[string]interface{}{
+		"type": "period_level_update",
+		"data": update,
+	}
+	
+	jsonData, err := json.Marshal(message)
+	if err != nil {
+		bm.logger.WithError(err).Error("Failed to encode period level update")
+		return
+	}
+	
+	// Send to all clients subscribed to this symbol
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	
+	subscribedClients := 0
+	for client := range bm.clients {
+		if client.IsSubscribed(update.Symbol) {
+			subscribedClients++
+			select {
+			case client.send <- jsonData:
+			default:
+				// Client buffer full
+				bm.logger.Warn("Client buffer full for period level update")
+			}
+		}
+	}
+	
+	if subscribedClients > 0 {
+		bm.logger.WithFields(logrus.Fields{
+			"symbol": update.Symbol,
+			"period": update.Period,
+			"type": update.Type,
+			"clients": subscribedClients,
+		}).Debug("Sent period level update to WebSocket clients")
+	}
+}
+
+// BroadcastPeriodBoundary sends period boundary events to all connected clients
+func (bm *BinaryManager) BroadcastPeriodBoundary(period string, affectedSymbols []string) {
+	// Create WebSocket message
+	message := map[string]interface{}{
+		"type": "period_boundary",
+		"data": map[string]interface{}{
+			"period": period,
+			"affected_symbols": affectedSymbols,
+			"timestamp": time.Now().Unix(),
+		},
+	}
+	
+	jsonData, err := json.Marshal(message)
+	if err != nil {
+		bm.logger.WithError(err).Error("Failed to encode period boundary event")
+		return
+	}
+	
+	// Broadcast to all clients
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	
+	for client := range bm.clients {
+		select {
+		case client.send <- jsonData:
+		default:
+			// Client buffer full
+		}
+	}
+	
+	bm.logger.WithFields(logrus.Fields{
+		"period": period,
+		"clients": len(bm.clients),
+	}).Info("Broadcasted period boundary event")
+}
+
 // RegisterClient adds a new binary client
 func (bm *BinaryManager) RegisterClient(client *BinaryClient) {
 	bm.register <- client
@@ -718,6 +795,37 @@ func (bm *BinaryManager) subscribeToUpdates() error {
 		bm.SendSyncError(symbol, errorMsg)
 	}); err != nil {
 		return fmt.Errorf("failed to subscribe to sync errors: %w", err)
+	}
+	
+	// Subscribe to period level updates
+	if err := bm.nats.SubscribeRaw("websocket.broadcast.period_levels", func(msg []byte) {
+		var update models.PeriodLevelUpdate
+		if err := json.Unmarshal(msg, &update); err != nil {
+			bm.logger.WithError(err).Error("Failed to unmarshal period level update")
+			return
+		}
+		bm.SendPeriodLevelUpdate(&update)
+	}); err != nil {
+		bm.logger.WithError(err).Warn("Failed to subscribe to period level updates")
+	} else {
+		bm.logger.Info("Subscribed to period level updates")
+	}
+	
+	// Subscribe to period boundary events
+	if err := bm.nats.SubscribeRaw("websocket.broadcast.period_boundary", func(msg []byte) {
+		var event struct {
+			Period          string   `json:"period"`
+			AffectedSymbols []string `json:"affected_symbols"`
+		}
+		if err := json.Unmarshal(msg, &event); err != nil {
+			bm.logger.WithError(err).Error("Failed to unmarshal period boundary event")
+			return
+		}
+		bm.BroadcastPeriodBoundary(event.Period, event.AffectedSymbols)
+	}); err != nil {
+		bm.logger.WithError(err).Warn("Failed to subscribe to period boundary events")
+	} else {
+		bm.logger.Info("Subscribed to period boundary events")
 	}
 	
 	return nil

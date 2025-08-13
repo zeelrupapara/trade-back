@@ -405,6 +405,18 @@ func (ec *Calculator) GetEnigmaLevel(symbol string) (*models.EnigmaData, error) 
 		}
 	}
 	
+	// Get current price from Redis cache
+	if ec.redis != nil {
+		ctx := context.Background()
+		if priceData, err := ec.redis.GetPrice(ctx, symbol); err == nil && priceData != nil {
+			ec.mu.Lock()
+			if _, exists := ec.symbols[symbol]; exists {
+				ec.symbols[symbol].LastPrice = priceData.Price
+			}
+			ec.mu.Unlock()
+		}
+	}
+	
 	// Now use the updated data
 	ec.mu.RLock()
 	symbolData, exists := ec.symbols[symbol]
@@ -416,6 +428,12 @@ func (ec *Calculator) GetEnigmaLevel(symbol string) (*models.EnigmaData, error) 
 	
 	if symbolData.ATH == 0 || symbolData.ATL == 0 {
 		return nil, fmt.Errorf("ATH/ATL not available")
+	}
+	
+	// If no current price, use ATL as fallback for calculation
+	if symbolData.LastPrice == 0 {
+		ec.logger.WithField("symbol", symbol).Warn("No current price available, using ATL as fallback")
+		symbolData.LastPrice = symbolData.ATL
 	}
 	
 	return ec.calculate(symbolData), nil

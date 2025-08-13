@@ -573,6 +573,125 @@ func (ic *InfluxClient) GetATHATL(ctx context.Context, symbol string) (ath, atl 
 	return ath, atl, nil
 }
 
+// GetPeriodHighLow retrieves high and low for a specific time period
+func (ic *InfluxClient) GetPeriodHighLow(ctx context.Context, symbol string, start, end time.Time) (high, low, open, close float64, err error) {
+	// Query for high
+	highQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+			|> range(start: %s, stop: %s)
+			|> filter(fn: (r) => r._measurement == "ohlcv" or r._measurement == "ohlcv_1d")
+			|> filter(fn: (r) => r.symbol == "%s")
+			|> filter(fn: (r) => r._field == "high")
+			|> max()
+	`, ic.bucket, start.Format(time.RFC3339), end.Format(time.RFC3339), symbol)
+	
+	result, err := ic.queryAPI.Query(ctx, highQuery)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("failed to query period high: %w", err)
+	}
+	
+	if result.Next() {
+		if v, ok := result.Record().Value().(float64); ok {
+			high = v
+		}
+	}
+	result.Close()
+	
+	// Query for low
+	lowQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+			|> range(start: %s, stop: %s)
+			|> filter(fn: (r) => r._measurement == "ohlcv" or r._measurement == "ohlcv_1d")
+			|> filter(fn: (r) => r.symbol == "%s")
+			|> filter(fn: (r) => r._field == "low")
+			|> min()
+	`, ic.bucket, start.Format(time.RFC3339), end.Format(time.RFC3339), symbol)
+	
+	result, err = ic.queryAPI.Query(ctx, lowQuery)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("failed to query period low: %w", err)
+	}
+	
+	if result.Next() {
+		if v, ok := result.Record().Value().(float64); ok {
+			low = v
+		}
+	}
+	result.Close()
+	
+	// Query for open (first close price in the period)
+	openQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+			|> range(start: %s, stop: %s)
+			|> filter(fn: (r) => r._measurement == "ohlcv" or r._measurement == "ohlcv_1d")
+			|> filter(fn: (r) => r.symbol == "%s")
+			|> filter(fn: (r) => r._field == "open")
+			|> first()
+	`, ic.bucket, start.Format(time.RFC3339), end.Format(time.RFC3339), symbol)
+	
+	result, err = ic.queryAPI.Query(ctx, openQuery)
+	if err != nil {
+		return high, low, 0, 0, nil // Open/close are optional
+	}
+	
+	if result.Next() {
+		if v, ok := result.Record().Value().(float64); ok {
+			open = v
+		}
+	}
+	result.Close()
+	
+	// Query for close (last close price in the period)
+	closeQuery := fmt.Sprintf(`
+		from(bucket: "%s")
+			|> range(start: %s, stop: %s)
+			|> filter(fn: (r) => r._measurement == "ohlcv" or r._measurement == "ohlcv_1d")
+			|> filter(fn: (r) => r.symbol == "%s")
+			|> filter(fn: (r) => r._field == "close")
+			|> last()
+	`, ic.bucket, start.Format(time.RFC3339), end.Format(time.RFC3339), symbol)
+	
+	result, err = ic.queryAPI.Query(ctx, closeQuery)
+	if err != nil {
+		return high, low, open, 0, nil // Close is optional
+	}
+	
+	if result.Next() {
+		if v, ok := result.Record().Value().(float64); ok {
+			close = v
+		}
+	}
+	result.Close()
+	
+	return high, low, open, close, nil
+}
+
+// GetMultiplePeriodHighLows retrieves high/low for multiple periods efficiently
+func (ic *InfluxClient) GetMultiplePeriodHighLows(ctx context.Context, symbol string, periods map[string][]time.Time) (map[string]struct{ High, Low, Open, Close float64 }, error) {
+	results := make(map[string]struct{ High, Low, Open, Close float64 })
+	
+	for period, times := range periods {
+		if len(times) != 2 {
+			continue
+		}
+		
+		high, low, open, close, err := ic.GetPeriodHighLow(ctx, symbol, times[0], times[1])
+		if err != nil {
+			ic.logger.WithError(err).WithField("period", period).Warn("Failed to get period high/low")
+			continue
+		}
+		
+		results[period] = struct{ High, Low, Open, Close float64 }{
+			High:  high,
+			Low:   low,
+			Open:  open,
+			Close: close,
+		}
+	}
+	
+	return results, nil
+}
+
 // has1MinuteData checks if we have 1-minute data for the given period
 func (ic *InfluxClient) has1MinuteData(ctx context.Context, symbol string, from, to time.Time) (bool, error) {
 	query := fmt.Sprintf(`

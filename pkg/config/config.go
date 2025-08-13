@@ -126,7 +126,7 @@ type BinanceConfig struct {
 type OANDAConfig struct {
 	APIKey         string        `env:"OANDA_API_KEY"`
 	AccountID      string        `env:"OANDA_ACCOUNT_ID"`
-	Environment    string        `env:"OANDA_ENVIRONMENT, default=practice"` // live or practice
+	Environment    string        `env:"OANDA_ENVIRONMENT, default=live"` // live or practice
 	APIURL         string        `env:"OANDA_API_URL"`                       // Auto-set based on environment
 	StreamURL      string        `env:"OANDA_STREAM_URL"`                    // Auto-set based on environment
 	MaxInstruments int           `env:"OANDA_MAX_INSTRUMENTS, default=100"`  // Max instruments per stream

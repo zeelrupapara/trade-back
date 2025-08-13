@@ -93,3 +93,37 @@ type ConnectionStatus struct {
 	Symbols     []string `json:"symbols"`
 	IPAddress   string   `json:"ip_address"`
 }
+
+// PeriodLevelUpdate represents a WebSocket update for period levels
+type PeriodLevelUpdate struct {
+	Type        string       `json:"type"`        // "new_extreme" | "period_boundary" | "level_approach"
+	Symbol      string       `json:"symbol"`
+	Period      PeriodType   `json:"period"`
+	Level       *PeriodLevel `json:"level,omitempty"`
+	OldValue    float64      `json:"old_value,omitempty"`
+	NewValue    float64      `json:"new_value,omitempty"`
+	CurrentPrice float64     `json:"current_price,omitempty"`
+	Timestamp   int64        `json:"timestamp"`
+}
+
+// PeriodBoundaryEvent represents when a new period starts
+type PeriodBoundaryEvent struct {
+	Period      PeriodType              `json:"period"`
+	OldPeriod   *PeriodLevel           `json:"old_period,omitempty"`
+	NewPeriod   *PeriodLevel           `json:"new_period,omitempty"`
+	AffectedSymbols []string           `json:"affected_symbols"`
+	Timestamp   int64                  `json:"timestamp"`
+}
+
+// LevelApproachAlert represents price approaching a Fibonacci level
+type LevelApproachAlert struct {
+	Symbol       string     `json:"symbol"`
+	Period       PeriodType `json:"period"`
+	Level        string     `json:"level"`        // "23.6%" | "38.2%" | "50%" | "61.8%" | "78.6%"
+	LevelPrice   float64    `json:"level_price"`
+	CurrentPrice float64    `json:"current_price"`
+	Distance     float64    `json:"distance"`
+	DistancePercent float64 `json:"distance_percent"`
+	Direction    string     `json:"direction"`    // "above" | "below"
+	Timestamp    int64      `json:"timestamp"`
+}

@@ -52,6 +52,7 @@ type App struct {
 	coingecko        *external.CoinGeckoClient
 	alphaVantage     *external.AlphaVantageClient
 	extremeTracker   *services.UnifiedExtremeTracker
+	periodExtremes   *services.PeriodExtremesService
 }
 
 // New creates a new application instance
@@ -131,6 +132,11 @@ func (a *App) Start() error {
 	// Start OHLCV aggregator
 	if err := a.ohlcvAgg.Start(a.ctx); err != nil {
 		return fmt.Errorf("failed to start OHLCV aggregator: %w", err)
+	}
+	
+	// Start period extremes service
+	if err := a.periodExtremes.Start(a.ctx); err != nil {
+		return fmt.Errorf("failed to start period extremes service: %w", err)
 	}
 	
 	// Start session manager
@@ -374,6 +380,14 @@ func (a *App) initializeExchange() error {
 	)
 	a.ohlcvAgg = aggregation.NewOHLCVAggregator(a.influxDB, a.natsClient, a.logger)
 	
+	// Create period extremes service
+	a.periodExtremes = services.NewPeriodExtremesService(
+		a.influxDB,
+		a.redisCache,
+		a.natsClient,
+		a.logger,
+	)
+	
 	// Create session manager
 	a.sessionMgr = session.NewManager(a.mysqlDB, a.natsClient, a.logger)
 	
@@ -439,6 +453,7 @@ func (a *App) initializeAPIServer() error {
 		a.instantEnigma,
 		a.hub,
 		a.extremeTracker,
+		a.periodExtremes,
 	)
 	
 	return nil
