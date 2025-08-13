@@ -186,23 +186,3 @@ INSERT IGNORE INTO system_config (config_key, config_value, description) VALUES
 ('batch_interval_ms', '50', 'Interval in milliseconds to send batched updates'),
 ('historical_data_days', '365', 'Number of days of historical data to fetch'),
 ('influx_retention_days', '730', 'Number of days to retain data in InfluxDB');
-
--- Insert some default active symbols (examples - can be customized)
-INSERT IGNORE INTO symbolsmap (exchange, symbol, full_name, instrument_type, base_currency, quote_currency, is_active) VALUES
-('binance', 'BTCUSDT', 'Bitcoin/USDT', 'SPOT', 'BTC', 'USDT', TRUE),
-('binance', 'ETHUSDT', 'Ethereum/USDT', 'SPOT', 'ETH', 'USDT', TRUE),
-('binance', 'BNBUSDT', 'Binance Coin/USDT', 'SPOT', 'BNB', 'USDT', TRUE),
-('binance', 'SOLUSDT', 'Solana/USDT', 'SPOT', 'SOL', 'USDT', TRUE),
-('binance', 'XRPUSDT', 'Ripple/USDT', 'SPOT', 'XRP', 'USDT', TRUE),
--- OANDA Forex Major Pairs
-('oanda', 'EUR_USD', 'Euro/US Dollar', 'FOREX', 'EUR', 'USD', TRUE),
-('oanda', 'GBP_USD', 'British Pound/US Dollar', 'FOREX', 'GBP', 'USD', TRUE),
-('oanda', 'USD_JPY', 'US Dollar/Japanese Yen', 'FOREX', 'USD', 'JPY', TRUE),
-('oanda', 'USD_CHF', 'US Dollar/Swiss Franc', 'FOREX', 'USD', 'CHF', TRUE),
-('oanda', 'AUD_USD', 'Australian Dollar/US Dollar', 'FOREX', 'AUD', 'USD', TRUE),
-('oanda', 'USD_CAD', 'US Dollar/Canadian Dollar', 'FOREX', 'USD', 'CAD', TRUE),
-('oanda', 'NZD_USD', 'New Zealand Dollar/US Dollar', 'FOREX', 'NZD', 'USD', TRUE),
--- OANDA Cross Pairs
-('oanda', 'EUR_GBP', 'Euro/British Pound', 'FOREX', 'EUR', 'GBP', TRUE),
-('oanda', 'EUR_JPY', 'Euro/Japanese Yen', 'FOREX', 'EUR', 'JPY', TRUE),
-('oanda', 'GBP_JPY', 'British Pound/Japanese Yen', 'FOREX', 'GBP', 'JPY', TRUE);
